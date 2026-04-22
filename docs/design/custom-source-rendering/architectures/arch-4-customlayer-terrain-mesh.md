@@ -66,7 +66,13 @@ Globe `tile`은 `base=128, min=32`이므로 z≥3에서 32로 고정. Mercator�
 
 **핵심 원칙**: "terrain이 있으면 terrain이 제공하는 mesh를 그대로 쓰는 것이 가장 안전". `createTileMesh`는 지형이 없을 때 또는 명시적으로 granularity=128로 호출할 때만 사용.
 
-## 기본 스켈레톤 (terrain 조건부 mesh 선택)
+## 두 가지 구현 패턴
+
+Mesh 선택 가이드에 따라 구현은 두 가지 명확한 경로로 분리된다. 두 경로를 **한 Layer 안에 섞지 않고** 각 시나리오를 별개 패턴으로 제시한다. 하이브리드 혼합 코드는 vertex 포맷/stride 차이 때문에 유지보수가 어렵다.
+
+### 패턴 1 — `createTileMesh` 단일 경로 (권장 기본)
+
+Terrain 활성 여부에 관계없이 **항상 `createTileMesh`로 mesh 생성**. granularity만 조건부 결정. 단일 코드 경로, 단일 vertex 포맷, 공개 API만 의존.
 
 ```js
 const EXTENT = 8192;
@@ -76,6 +82,8 @@ const layer = {
   type: 'custom',
   shaderMap: new Map(),
   meshMap: new Map(),
+
+  onAdd(map, gl) { this.map = map; },
 
   getShader(gl, shaderDescription) {
     if (this.shaderMap.has(shaderDescription.variantName)) {
@@ -101,24 +109,20 @@ const layer = {
     return result;
   },
 
-  // ★ terrain이 있으면 terrain의 mesh를 그대로 빌려온다 (vertex 밀도 보장)
-  getTerrainMesh(tileID) {
-    const mesh = this.map.terrain.getTerrainMesh(tileID);
-    // mesh = {vertexBuffer, indexBuffer, segments}
-    return mesh;
-  },
-
-  // terrain 없는 경우 (또는 자체 밀도 관리 원할 때)
-  getCreatedMesh(gl, x, y, z) {
+  getMesh(gl, x, y, z) {
+    // granularity 결정:
+    // - terrain 활성: 128 (terrain meshSize와 동등, elevation 샘플링 밀도 확보)
+    // - terrain 비활성: projection의 subdivisionGranularity 사용 (곡률 재현에 충분)
     const granularity = this.map.terrain
-      ? 128   // terrain과 동일 밀도
+      ? 128
       : this.map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z);
+
     const north = y === 0;
     const south = y === (1 << z) - 1;
     const key = `${granularity}_${north}_${south}`;
     if (this.meshMap.has(key)) return this.meshMap.get(key);
 
-    const meshBuffers = maplibregl.createTileMesh({
+    const buffers = maplibregl.createTileMesh({
       granularity,
       generateBorders: false,
       extendToNorthPole: north,
@@ -127,22 +131,19 @@ const layer = {
 
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-    gl.bufferData(gl.ARRAY_BUFFER, meshBuffers.vertices, gl.STATIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, buffers.vertices, gl.STATIC_DRAW);
     const ibo = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, meshBuffers.indices, gl.STATIC_DRAW);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, buffers.indices, gl.STATIC_DRAW);
 
-    const mesh = {vbo, ibo, indexCount: meshBuffers.indices.byteLength / 2};
+    const mesh = {vbo, ibo, indexCount: buffers.indices.byteLength / 2};
     this.meshMap.set(key, mesh);
     return mesh;
   },
 
-  onAdd(map, gl) { this.map = map; },
-
   render(gl, args) {
     const {program, aPos, locations} = this.getShader(gl, args.shaderData);
     const isGlobe = args.shaderData.variantName === 'globe';
-    const terrain = this.map.terrain;
 
     gl.useProgram(program);
     gl.enable(gl.BLEND);
@@ -153,45 +154,116 @@ const layer = {
     for (const tileID of tiles) {
       if (isGlobe && tileID.wrap !== 0) continue;
 
-      const projectionData = this.map.transform.getProjectionData({
+      const proj = this.map.transform.getProjectionData({
         overscaledTileID: tileID,
         applyTerrainMatrix: false,
         applyGlobeMatrix: true,
       });
+      gl.uniformMatrix4fv(locations.u_projection_matrix, false, proj.mainMatrix);
+      gl.uniformMatrix4fv(locations.u_projection_fallback_matrix, false, proj.fallbackMatrix);
+      gl.uniform4f(locations.u_projection_clipping_plane, ...proj.clippingPlane);
+      gl.uniform1f(locations.u_projection_transition, proj.projectionTransition);
+      gl.uniform4f(locations.u_projection_tile_mercator_coords, ...proj.tileMercatorCoords);
 
-      gl.uniformMatrix4fv(locations.u_projection_matrix, false, projectionData.mainMatrix);
-      gl.uniformMatrix4fv(locations.u_projection_fallback_matrix, false, projectionData.fallbackMatrix);
-      gl.uniform4f(locations.u_projection_clipping_plane, ...projectionData.clippingPlane);
-      gl.uniform1f(locations.u_projection_transition, projectionData.projectionTransition);
-      gl.uniform4f(locations.u_projection_tile_mercator_coords, ...projectionData.tileMercatorCoords);
-
-      if (terrain) {
-        // ★ terrain 활성: terrain mesh 재사용 (129×129 vertex, elevation 샘플링에 충분)
-        const mesh = terrain.getTerrainMesh(tileID);
-        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
-        gl.enableVertexAttribArray(aPos);
-        // terrain mesh는 Pos3dArray (x, y, z) 포맷. stride=8, a_pos는 처음 2 컴포넌트
-        gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 8, 0);
-        gl.drawElements(gl.TRIANGLES, mesh.segments.get()[0].primitiveLength * 3,
-                        gl.UNSIGNED_SHORT, 0);
-      } else {
-        // terrain 비활성: createTileMesh로 충분
-        const mesh = this.getCreatedMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
-        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
-        gl.enableVertexAttribArray(aPos);
-        gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
-        gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
-      }
+      // 단일 vertex 포맷: Int16 × 2, stride=0 (기본 packed)
+      const mesh = this.getMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
+      gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
     }
-  }
+  },
 };
-
-map.addLayer(layer);
 ```
 
-**필수 uniform 리스트**:
+**장점**:
+- 단일 코드 경로, 단일 vertex 포맷(Int16 × 2, stride=0)
+- 공개 API(`createTileMesh`) 만 의존. MapLibre 업그레이드 안정
+- terrain 유무 분기가 granularity 결정 한 줄에만 존재
+- shader·draw call 로직 동일
+
+**단점**:
+- terrain 활성 시 terrain이 이미 보유한 mesh와 중복 생성 (메모리 ~100KB per unique key × granularity 수; 실무상 무시 가능)
+
+### 패턴 2 — terrain mesh 직접 재활용 (메모리 최적화 원할 때)
+
+Terrain 활성 시 `terrain.getTerrainMesh()` mesh 인스턴스를 그대로 **참조만** 해서 draw. mesh 중복 생성 제거. 단 `@internal` API 의존 + Pos3dArray(stride=8) vertex 포맷 처리 필요.
+
+```js
+onAdd(map, gl) { this.map = map; },
+
+render(gl, args) {
+  const {program, aPos, locations} = this.getShader(gl, args.shaderData);
+  const isGlobe = args.shaderData.variantName === 'globe';
+  const terrain = this.map.terrain;
+
+  gl.useProgram(program);
+  // ... blend 등 setup
+
+  const tiles = terrain
+    ? terrain.tileManager.getRenderableTiles().map(t => t.tileID)
+    : this.map.coveringTiles({tileSize: 512});
+
+  for (const tileID of tiles) {
+    if (isGlobe && !terrain && tileID.wrap !== 0) continue;
+
+    const proj = this.map.transform.getProjectionData({
+      overscaledTileID: tileID,
+      applyTerrainMatrix: false,
+      applyGlobeMatrix: true,
+    });
+    // uniforms 바인딩 (패턴 1과 동일)
+
+    if (terrain) {
+      // @internal API 사용: terrain mesh는 Pos3dArray (x, y, frame-bit) 3컴포넌트, stride=8
+      // VertexBuffer/IndexBuffer 래퍼 접근도 @internal
+      const mesh = terrain.getTerrainMesh(tileID);
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+      gl.enableVertexAttribArray(aPos);
+      // stride=8이지만 a_pos는 처음 2컴포넌트(x,y)만 읽음. 3번째 frame-bit는 무시
+      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 8, 0);
+      gl.drawElements(
+        gl.TRIANGLES,
+        mesh.segments.get()[0].primitiveLength * 3,
+        gl.UNSIGNED_SHORT,
+        0
+      );
+    } else {
+      // 폴백: createTileMesh 경로 (패턴 1의 getMesh 사용)
+      const mesh = this.getMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
+      gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+    }
+  }
+}
+```
+
+**장점**:
+- terrain이 이미 만들어둔 mesh를 참조만, 메모리 중복 없음
+- terrain의 pole/frame vertex가 그대로 활용됨 (stitching 유리)
+- terrain의 `tileManager.getRenderableTiles()`로 타일 목록도 공유
+
+**단점**:
+- `@internal` API 의존: `mesh.vertexBuffer.buffer`, `mesh.indexBuffer.buffer`, `mesh.segments.get()` 모두 내부 타입
+- 두 개의 vertex 포맷/stride 경로를 layer 코드가 관리해야 함
+- MapLibre 마이너 업그레이드 시 검증 필요
+
+### 선택 권장
+
+| 우선순위 | 권장 패턴 |
+|---|---|
+| MapLibre 독립성, API 안정성 | **패턴 1** (`createTileMesh` 단일) |
+| 메모리 최소화, terrain 심도 통합 | 패턴 2 (terrain mesh 참조) |
+| 대부분의 실무 | **패턴 1** 기본값, 필요 시 2로 전환 |
+
+군사/임베디드 환경에서 메모리가 타이트해 중복 mesh가 부담이면 패턴 2 고려. 그 외에는 패턴 1이 유지보수와 버전 호환성 면에서 우수.
+
+**필수 uniform 리스트** (두 패턴 공통):
 ```js
 const uniforms = [
   'u_projection_matrix', 'u_projection_fallback_matrix',
