@@ -197,9 +197,11 @@ globe에서 흔한 상황 (구의 far-side까지 타일 요청 가능).
 
 **Arch 4 (가장 유사)**:
 - `render` 로직 거의 그대로 유지
-- **`maplibregl.createTileMesh()` 기반 per-tile 루프로 감싸기** (공식 패턴, 공개 API)
-- 기존 `terrain.getTerrainMesh` 사용하던 코드는 `createTileMesh`로 교체 권장 — 공개 API 사용으로 업그레이드 안정성 향상
+- per-tile 루프로 감싸기. mesh 소스는 상황에 따라 선택:
+  - terrain OFF: `maplibregl.createTileMesh()` (공개 API)
+  - terrain ON + elevation 정렬 중요: `terrain.getTerrainMesh()` (@internal, 129×129 vertex)
 - 셰이더의 `projectTile`/`projectTileFor3D`는 `args.shaderData.vertexShaderPrelude`로 자동 제공
+- Globe에서 render 루프에 `wrap !== 0` 필터를 넣지 말 것 (Q28 참조)
 
 **Arch 1**:
 - `render` 로직을 `prepare`로 이전

@@ -33,7 +33,7 @@ CustomLayer가 `projectTile` 등을 호출하려면 다음 uniform을 바인딩�
 - `u_projection_transition` — `projectionData.projectionTransition` (0..1)
 - `u_projection_tile_mercator_coords` — `projectionData.tileMercatorCoords` (tile bbox mercator)
 
-## Mesh 선택 가이드 (★ 중요 — vertex 밀도 차이)
+## Mesh 선택 가이드
 
 terrain 활성화 여부에 따라 적절한 mesh 생성 방식이 다르다. 이유: elevation 샘플링은 per-vertex interpolation이므로 충분한 vertex 밀도가 없으면 elevation 왜곡이 발생한다.
 
@@ -381,17 +381,12 @@ render(gl, args) {
 - 셰이더가 terrain 패턴(`a_pos3d.z == 1.0 ? u_ele_delta : 0.0`)을 정확히 복제해야 함
 - MapLibre 마이너 업그레이드 시 이 5가지 지점 모두 검증
 
-**terrain OFF 폴백**: Pattern 1의 `createTileMesh` 경로로 전환. `_renderFlat` 내부에 별도 구현.
+**terrain OFF 폴백**: 패턴 1의 `createTileMesh` 경로로 전환.
 
-### 선택 권장
+### 패턴 선택 기준
 
-| 우선순위 | 권장 패턴 |
-|---|---|
-| MapLibre 독립성, API 안정성 | **패턴 1** (`createTileMesh` 단일) |
-| 메모리 최소화, terrain 심도 통합 | 패턴 2 (terrain mesh 참조) |
-| 대부분의 실무 | **패턴 1** 기본값, 필요 시 2로 전환 |
-
-군사/임베디드 환경에서 메모리가 타이트해 중복 mesh가 부담이면 패턴 2 고려. 그 외에는 패턴 1이 유지보수와 버전 호환성 면에서 우수.
+- **패턴 1 (기본)**: API 안정성·유지보수 우선. 대부분의 실무.
+- **패턴 2**: terrain elevation 정렬 완벽성·메모리 최소화가 필수일 때. 군사/임베디드 등.
 
 **필수 uniform 리스트** (두 패턴 공통):
 ```js
@@ -623,28 +618,6 @@ CustomLayer 기본 한계. 자체 공간 인덱스 유지 필요.
 
 - 메시 캐시 크기 제한 (granularity별 최대 N개)
 - `onRemove`에서 VBO/IBO/program 해제
-
-## Mesh 선택 요약 (terrain 활성 여부 기준)
-
-| 항목 | Terrain OFF | Terrain ON |
-|---|---|---|
-| Mesh 소스 | `maplibregl.createTileMesh` (공개 API) | `terrain.getTerrainMesh(tileID)` (`@internal`, 권장) |
-| Vertex 밀도 | 4~1,089 (projection별) | 16,641 고정 (129×129) |
-| Projection matrix | `map.transform.getProjectionData(...)` | 동일 |
-| 셰이더 prelude | `args.shaderData.vertexShaderPrelude` | 동일 |
-| Pole 처리 | `extendToNorthPole`/`extendToSouthPole` 플래그 | terrain 내부 자동 |
-| Vertex format | Int16 × 2 (`a_pos` 2컴포넌트, stride 0 or 4) | Int16 × 3 (`Pos3dArray`, stride 8) |
-| Elevation 샘플링 | 불필요 | `terrain.getTerrainData` + `get_elevation` 셰이더 함수 복제 |
-
-### 왜 terrain 활성 시 `createTileMesh`만 쓰면 안 되나
-
-`subdivisionGranularity.tile`은 projection 곡률 재현용 granularity이지 elevation 재현용이 아니다. Mercator에서는 `noSubdivision` → 타일당 2×2=4 vertex만 생성되므로, 4개 vertex의 elevation만 샘플링되어 타일 내부 elevation 변화가 선형으로 납작해진다. Globe에서도 z≥3이면 32×32로 고정되어 DEM 해상도를 따라가지 못한다.
-
-Terrain이 활성일 때는 MapLibre 내부에서 `meshSize=128` 고정 mesh를 쓰고, 이를 `terrain.getTerrainMesh()`로 재사용하는 것이 가장 자연스럽다. 공개 API에서 동일 밀도를 원하면 `createTileMesh({granularity: 128})`로 명시 호출.
-
-### 기존 문서 대비 변경점
-
-이전 문서 버전은 "모든 경우에 `createTileMesh`"를 권장했으나, 이는 terrain 활성 시 vertex 부족 문제를 간과한 것이다. 현재 버전은 terrain 여부에 따른 분기를 권장한다.
 
 ## 검증 체크리스트
 
