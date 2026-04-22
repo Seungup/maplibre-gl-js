@@ -67,7 +67,13 @@ globe ↔ mercator 전환 애니메이션의 현재 상태. `0`이면 순수 mer
 `{granularity?: number, generateBorders?: boolean, extendToNorthPole?: boolean, extendToSouthPole?: boolean}`. `generateBorders: true`는 타일 경계 seam 방지용 border mesh 추가. pole 플래그는 globe 모드에서 구의 극점 커버용. 정의: `src/util/create_tile_mesh.ts`.
 
 **subdivisionGranularity**
-Projection interface의 공개 getter. `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)` 호출로 줌 레벨별 적정 mesh 분할 횟수 획득. mercator는 저 granularity, globe는 고 granularity 반환. 정의: `src/geo/projection/projection.ts:91`.
+Projection interface의 공개 getter. `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)` 호출로 줌 레벨별 적정 mesh 분할 횟수 획득. 정의: `src/geo/projection/projection.ts:91`.
+공식: `max(floor(baseZoomGranularity / (1 << z)), minGranularity, 1)` (`src/render/subdivision_granularity_settings.ts:36-39`)
+- **Mercator**: `SubdivisionGranularitySetting.noSubdivision` → 모든 zoom에서 granularity=1 → vertex 2×2=4개. projection 곡률이 없으므로 충분하지만 terrain elevation 샘플링에는 부족.
+- **Globe** (`vertical_perspective_projection.ts:28`): `tile: SubdivisionGranularityExpression(base=128, min=32)` → z=0에서 128, z≥3에서 32 clamp → vertex 33×33=1,089. 구면 곡률에 충분하지만 terrain elevation 고해상도에는 부족.
+
+**terrain.meshSize**
+Terrain 내부 mesh 해상도 상수. 고정값 `128` (`src/render/terrain.ts:146`). `terrain.getTerrainMesh()`가 129×129=16,641 vertex 그리드 생성. Terrain elevation 샘플링에 적합한 밀도. Arch 4에서 terrain 활성 시 이 mesh를 재사용하는 것이 권장 패턴.
 
 **vertexShaderPrelude**
 CustomLayer의 `render(gl, args)`에서 `args.shaderData.vertexShaderPrelude`로 접근. 현재 projection에 맞는 `projectTile`/`projectTileFor3D`/`projectLineThickness` 등 함수를 셰이더에 자동 제공. mercator/globe 분기 불필요. 생성 지점: `src/webgl/draw/draw_custom.ts:26`.

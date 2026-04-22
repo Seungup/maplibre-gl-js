@@ -33,7 +33,40 @@ CustomLayer가 `projectTile` 등을 호출하려면 다음 uniform을 바인딩�
 - `u_projection_transition` — `projectionData.projectionTransition` (0..1)
 - `u_projection_tile_mercator_coords` — `projectionData.tileMercatorCoords` (tile bbox mercator)
 
-## 기본 스켈레톤 (terrain 없음, 공식 예제 패턴)
+## Mesh 선택 가이드 (★ 중요 — vertex 밀도 차이)
+
+terrain 활성화 여부에 따라 적절한 mesh 생성 방식이 다르다. 이유: elevation 샘플링은 per-vertex interpolation이므로 충분한 vertex 밀도가 없으면 elevation 왜곡이 발생한다.
+
+### Vertex 밀도 비교
+
+| 방식 | 소스 | vertex per tile (대표값) |
+|---|---|---|
+| `terrain.getTerrainMesh(tileID)` | `meshSize = 128` 고정 (`src/render/terrain.ts:146`) | **129×129 = 16,641** |
+| `createTileMesh` + `subdivisionGranularity.tile` (globe, z=0) | `granularity = 128` | 129×129 = 16,641 |
+| `createTileMesh` + `subdivisionGranularity.tile` (globe, z≥3) | `granularity = 32` (min clamp) | 33×33 = **1,089** |
+| `createTileMesh` + `subdivisionGranularity.tile` (mercator) | `noSubdivision → granularity = 1` | 2×2 = **4** ← terrain에 불충분 |
+| `createTileMesh` + 명시적 `{granularity: 128}` | 호출자 결정 | 129×129 = 16,641 |
+
+`subdivisionGranularity` 공식 (`src/render/subdivision_granularity_settings.ts:36-39`):
+```
+getGranularityForZoomLevel(z) = max(floor(baseZoomGranularity / (1 << z)), minGranularity, 1)
+```
+
+Globe `tile`은 `base=128, min=32`이므로 z≥3에서 32로 고정. Mercator는 모두 `(0, 0)`이므로 항상 1.
+
+### 권장 조합
+
+| 시나리오 | 권장 mesh 소스 | 근거 |
+|---|---|---|
+| **Terrain ON (임의 projection)** | **`terrain.getTerrainMesh(tileID)`** | elevation 샘플링에 충분한 129×129 격자. 공유 캐싱 자동 |
+| Terrain OFF + Globe | `createTileMesh` + `subdivisionGranularity.tile` | 구면 곡률 재현에 32+ 충분, 공개 API 안정성 |
+| Terrain OFF + Mercator | `createTileMesh` + `{granularity: 1}` 또는 단순 쿼드 | 평면이므로 2×2로 충분 |
+| Terrain OFF, 그러나 per-fragment 효과(gradient 등) 필요 | `createTileMesh` + 명시적 granularity (16~32) | 프래그먼트 정확도 확보 |
+| Terrain ON + 자체 mesh 관리 원함 | `createTileMesh` + `{granularity: 128}` | `terrain.getTerrainMesh`와 동등 밀도, 공개 API |
+
+**핵심 원칙**: "terrain이 있으면 terrain이 제공하는 mesh를 그대로 쓰는 것이 가장 안전". `createTileMesh`는 지형이 없을 때 또는 명시적으로 granularity=128로 호출할 때만 사용.
+
+## 기본 스켈레톤 (terrain 조건부 mesh 선택)
 
 ```js
 const EXTENT = 8192;
@@ -48,7 +81,6 @@ const layer = {
     if (this.shaderMap.has(shaderDescription.variantName)) {
       return this.shaderMap.get(shaderDescription.variantName);
     }
-
     const vertexSource = `#version 300 es
       ${shaderDescription.vertexShaderPrelude}
       ${shaderDescription.define}
@@ -58,22 +90,29 @@ const layer = {
         gl_Position = projectTile(a_pos);
         v_pos = a_pos / float(${EXTENT});
       }`;
-
     const fragmentSource = `#version 300 es
       precision mediump float;
       in vec2 v_pos;
       out highp vec4 fragColor;
       void main() { fragColor = vec4(v_pos, 0.0, 0.5); }`;
-
-    // compile + link 생략
     const {program, aPos, locations} = compileProgram(gl, vertexSource, fragmentSource);
     const result = {program, aPos, locations};
     this.shaderMap.set(shaderDescription.variantName, result);
     return result;
   },
 
-  getTileMesh(gl, x, y, z) {
-    const granularity = map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z);
+  // ★ terrain이 있으면 terrain의 mesh를 그대로 빌려온다 (vertex 밀도 보장)
+  getTerrainMesh(tileID) {
+    const mesh = this.map.terrain.getTerrainMesh(tileID);
+    // mesh = {vertexBuffer, indexBuffer, segments}
+    return mesh;
+  },
+
+  // terrain 없는 경우 (또는 자체 밀도 관리 원할 때)
+  getCreatedMesh(gl, x, y, z) {
+    const granularity = this.map.terrain
+      ? 128   // terrain과 동일 밀도
+      : this.map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z);
     const north = y === 0;
     const south = y === (1 << z) - 1;
     const key = `${granularity}_${north}_${south}`;
@@ -103,6 +142,7 @@ const layer = {
   render(gl, args) {
     const {program, aPos, locations} = this.getShader(gl, args.shaderData);
     const isGlobe = args.shaderData.variantName === 'globe';
+    const terrain = this.map.terrain;
 
     gl.useProgram(program);
     gl.enable(gl.BLEND);
@@ -111,11 +151,11 @@ const layer = {
     const tiles = this.map.coveringTiles({tileSize: 512});
 
     for (const tileID of tiles) {
-      // globe에서는 wrap !== 0 타일 스킵 (구면에서 중복)
       if (isGlobe && tileID.wrap !== 0) continue;
 
       const projectionData = this.map.transform.getProjectionData({
         overscaledTileID: tileID,
+        applyTerrainMatrix: false,
         applyGlobeMatrix: true,
       });
 
@@ -125,12 +165,25 @@ const layer = {
       gl.uniform1f(locations.u_projection_transition, projectionData.projectionTransition);
       gl.uniform4f(locations.u_projection_tile_mercator_coords, ...projectionData.tileMercatorCoords);
 
-      const mesh = this.getTileMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
-      gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+      if (terrain) {
+        // ★ terrain 활성: terrain mesh 재사용 (129×129 vertex, elevation 샘플링에 충분)
+        const mesh = terrain.getTerrainMesh(tileID);
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+        gl.enableVertexAttribArray(aPos);
+        // terrain mesh는 Pos3dArray (x, y, z) 포맷. stride=8, a_pos는 처음 2 컴포넌트
+        gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 8, 0);
+        gl.drawElements(gl.TRIANGLES, mesh.segments.get()[0].primitiveLength * 3,
+                        gl.UNSIGNED_SHORT, 0);
+      } else {
+        // terrain 비활성: createTileMesh로 충분
+        const mesh = this.getCreatedMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
+        gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
+        gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
+      }
     }
   }
 };
@@ -283,19 +336,27 @@ CustomLayer 기본 한계. 자체 공간 인덱스 유지 필요.
 - 메시 캐시 크기 제한 (granularity별 최대 N개)
 - `onRemove`에서 VBO/IBO/program 해제
 
-## 마이그레이션 주의사항 (기존 "terrain mesh 재활용" 패턴에서)
+## Mesh 선택 요약 (terrain 활성 여부 기준)
 
-이전 문서 버전은 `map.terrain.getTerrainMesh()` 직접 사용을 권장했으나, 이는 `@internal`이며 공식 `createTileMesh`가 더 적절. 변경점:
+| 항목 | Terrain OFF | Terrain ON |
+|---|---|---|
+| Mesh 소스 | `maplibregl.createTileMesh` (공개 API) | `terrain.getTerrainMesh(tileID)` (`@internal`, 권장) |
+| Vertex 밀도 | 4~1,089 (projection별) | 16,641 고정 (129×129) |
+| Projection matrix | `map.transform.getProjectionData(...)` | 동일 |
+| 셰이더 prelude | `args.shaderData.vertexShaderPrelude` | 동일 |
+| Pole 처리 | `extendToNorthPole`/`extendToSouthPole` 플래그 | terrain 내부 자동 |
+| Vertex format | Int16 × 2 (`a_pos` 2컴포넌트, stride 0 or 4) | Int16 × 3 (`Pos3dArray`, stride 8) |
+| Elevation 샘플링 | 불필요 | `terrain.getTerrainData` + `get_elevation` 셰이더 함수 복제 |
 
-| 기존 (`@internal`) | 신규 (공개 API) |
-|---|---|
-| `terrain.getTerrainMesh(tileID)` | `maplibregl.createTileMesh(opts, '16bit')` |
-| 고정 meshSize=128 | `getGranularityForZoomLevel(z)` 동적 granularity |
-| 자체 북/남극 처리 | `extendToNorthPole`/`extendToSouthPole` 플래그 |
-| 자체 projection matrix 구성 | `map.transform.getProjectionData(...)` |
-| 자체 projectTile 구현 | `shaderData.vertexShaderPrelude` 자동 제공 |
+### 왜 terrain 활성 시 `createTileMesh`만 쓰면 안 되나
 
-Terrain elevation 샘플링(`terrain.getTerrainData` + `get_elevation`)은 @internal이므로 변경 없음.
+`subdivisionGranularity.tile`은 projection 곡률 재현용 granularity이지 elevation 재현용이 아니다. Mercator에서는 `noSubdivision` → 타일당 2×2=4 vertex만 생성되므로, 4개 vertex의 elevation만 샘플링되어 타일 내부 elevation 변화가 선형으로 납작해진다. Globe에서도 z≥3이면 32×32로 고정되어 DEM 해상도를 따라가지 못한다.
+
+Terrain이 활성일 때는 MapLibre 내부에서 `meshSize=128` 고정 mesh를 쓰고, 이를 `terrain.getTerrainMesh()`로 재사용하는 것이 가장 자연스럽다. 공개 API에서 동일 밀도를 원하면 `createTileMesh({granularity: 128})`로 명시 호출.
+
+### 기존 문서 대비 변경점
+
+이전 문서 버전은 "모든 경우에 `createTileMesh`"를 권장했으나, 이는 terrain 활성 시 vertex 부족 문제를 간과한 것이다. 현재 버전은 terrain 여부에 따른 분기를 권장한다.
 
 ## 검증 체크리스트
 

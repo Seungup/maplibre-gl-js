@@ -234,19 +234,28 @@ MapLibre가 WebGPU 백엔드를 도입하면 `Texture`/`Context` 추상화가 �
 
 ### Q27. Arch 4에서 `createTileMesh`와 `terrain.getTerrainMesh` 차이?
 
+**핵심 차이는 vertex 밀도**. elevation 샘플링은 per-vertex interpolation이므로 terrain 활성 시 밀도가 중요하다.
+
 | 항목 | `maplibregl.createTileMesh` | `terrain.getTerrainMesh` |
 |---|---|---|
-| 공개 여부 | **공개 (`src/index.ts:382` export)** | `@internal` |
-| 안정성 | 안정 — 공식 예제 reference | MapLibre 내부용, 마이너 업그레이드 변경 가능 |
-| Granularity | `options.granularity`로 호출자 제어 | 고정 `meshSize = 128` |
+| 공개 여부 | 공개 (`src/index.ts:382` export) | `@internal` |
+| Mercator에서 vertex 수 | **2×2 = 4** (`noSubdivision`) | 129×129 = 16,641 |
+| Globe z=0 vertex 수 | 129×129 = 16,641 | 129×129 = 16,641 |
+| Globe z≥3 vertex 수 | **33×33 = 1,089** (min 32 clamp) | 129×129 = 16,641 |
+| Granularity 제어 | 호출자 (`options.granularity`) | 고정 `meshSize = 128` |
+| Vertex format | `Int16 × 2` (a_pos x,y) | `Pos3dArray` (x, y, frame-bit) stride=8 |
+| Output | `{vertices, indices, uses32bitIndices}` typed array | VBO/IBO 포함 `Mesh` 객체 (즉시 바인딩 가능) |
 | Pole 처리 | `extendToNorthPole`/`extendToSouthPole` 플래그 | globe에서 자동 판정 |
-| Border 생성 | `generateBorders` 플래그 (seam 방지 2-pass 렌더 가능) | 자체 관리 |
-| Output | `{vertices, indices, uses32bitIndices}` typed array | VBO/IBO 포함 `Mesh` 객체 |
-| 사용 시점 | CustomLayer 전반 (globe 포함) | terrain 내부 전용 |
+| 캐싱 | 호출자 책임 | 내장 `_meshCache` (tile 간 공유) |
 
-**권장**: Arch 4에서는 **`createTileMesh` 사용**. `subdivisionGranularity`로 줌별 분할 조정, pole 플래그로 globe 대응. terrain elevation 샘플링은 별도 `terrain.getTerrainData` 사용(여전히 `@internal`).
+**권장**:
 
-**관련**: [Arch 4 공식 패턴](architectures/arch-4-customlayer-terrain-mesh.md) · [Arch 4 마이그레이션 주의사항](architectures/arch-4-customlayer-terrain-mesh.md#마이그레이션-주의사항-기존-terrain-mesh-재활용-패턴에서)
+- **Terrain OFF**: `createTileMesh` + `subdivisionGranularity.tile.getGranularityForZoomLevel(z)` 사용. 공개 안정 API + projection 곡률 재현에 충분.
+- **Terrain ON**: `terrain.getTerrainMesh(tileID)` 사용. `createTileMesh`의 기본 granularity는 elevation 재현에 부족 (mercator는 vertex 4개, globe 고줌은 1,089개). `createTileMesh`로 동일 밀도를 확보하려면 `{granularity: 128}` 명시 호출.
+
+**왜 `createTileMesh`만으로는 terrain에 불충분한가**: `subdivisionGranularity.tile`은 **projection 곡률**(globe의 구면) 재현용이지 **elevation 샘플링**용이 아니다. Mercator는 `noSubdivision`이라 vertex 4개만 생성 → 타일 내부 elevation이 선형 평탄화됨. Globe도 z≥3에서 32로 고정되어 DEM 해상도를 못 따라감.
+
+**관련**: [Arch 4 Mesh 선택 가이드](architectures/arch-4-customlayer-terrain-mesh.md#mesh-선택-가이드--중요--vertex-밀도-차이)
 
 ---
 

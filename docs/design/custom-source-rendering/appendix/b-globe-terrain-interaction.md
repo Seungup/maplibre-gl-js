@@ -113,16 +113,19 @@ if (renderOptions.isRenderingGlobe && !this.style.map.terrain) {
 3. `drawTerrain`: 동일
 4. 결과: globe + terrain 위에 픽셀 완벽한 1px 라인
 
-### Arch 4의 Globe + Terrain 흐름 (공식 `createTileMesh` 패턴)
+### Arch 4의 Globe + Terrain 흐름 (mesh 조건부 선택)
 
 1. `CustomLayer.render(gl, args)`에서 `map.coveringTiles()` 또는 자체 enumeration으로 가시 타일 목록 획득
-2. 타일마다 `maplibregl.createTileMesh({granularity, extendToNorthPole, extendToSouthPole}, '16bit')` 호출 (공개 API, 캐싱 권장)
-   - granularity는 `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)`로 결정
-   - pole 타일은 `extendToNorthPole`/`extendToSouthPole: true`
-3. `map.transform.getProjectionData({overscaledTileID, applyGlobeMatrix: true})`로 projection uniform 세트 획득 (`mainMatrix`, `fallbackMatrix`, `clippingPlane`, `projectionTransition`, `tileMercatorCoords`)
+2. Mesh 선택 — **terrain 활성 여부에 따라 분기**:
+   - **Terrain ON**: `map.terrain.getTerrainMesh(tileID)` 사용 (`@internal`, 129×129=16,641 vertex, elevation 샘플링에 적합)
+   - **Terrain OFF**: `maplibregl.createTileMesh({granularity, extendToNorthPole, extendToSouthPole}, '16bit')` 사용 (공개 API, projection 곡률만 고려)
+     - granularity는 `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)`
+3. `map.transform.getProjectionData({overscaledTileID, applyGlobeMatrix: true, applyTerrainMatrix: false})`로 projection uniform 세트 획득 (`mainMatrix`, `fallbackMatrix`, `clippingPlane`, `projectionTransition`, `tileMercatorCoords`)
 4. 셰이더는 `args.shaderData.vertexShaderPrelude`가 자동 제공하는 `projectTile(a_pos)` 또는 `projectTileFor3D(a_pos, ele)` 호출 — mercator/globe 분기 불필요
-5. Terrain drape 필요 시 `map.terrain.getTerrainData(tileID)`(@internal)로 DEM 텍스처/행렬 획득, 셰이더에서 `get_elevation(a_pos)` 호출 (함수는 `_prelude.vertex.glsl`에서 수동 복제)
+5. Terrain drape 필요 시 `map.terrain.getTerrainData(tileID)`(@internal)로 DEM 텍스처/행렬 획득, 셰이더에서 `get_elevation(a_pos)` 호출 (함수는 `_prelude.vertex.glsl:146-166`에서 수동 복제)
 6. 결과: 구면/평면 + (선택적) elevation 위에 사용자 도메인 렌더
+
+**왜 terrain 활성 시 `createTileMesh`만 쓰면 안 되는가**: `subdivisionGranularity.tile`은 projection 곡률용이지 DEM 해상도용이 아니다. Mercator는 2×2=4 vertex, globe z≥3는 33×33=1,089 vertex만 생성. Elevation은 per-vertex interpolation이므로 타일 내부 변화가 평탄화된다. Terrain 활성 시에는 terrain 내부 meshSize=128 mesh(129×129=16,641 vertex)를 재사용해야 DEM 해상도 재현 가능.
 
 ### Globe 전환 애니메이션 (transitionState 중간값)
 
