@@ -127,6 +127,16 @@ if (renderOptions.isRenderingGlobe && !this.style.map.terrain) {
 
 **왜 terrain 활성 시 `createTileMesh`만 쓰면 안 되는가**: `subdivisionGranularity.tile`은 projection 곡률용이지 DEM 해상도용이 아니다. Mercator는 2×2=4 vertex, globe z≥3는 33×33=1,089 vertex만 생성. Elevation은 per-vertex interpolation이므로 타일 내부 변화가 평탄화된다. Terrain 활성 시에는 terrain 내부 meshSize=128 mesh(129×129=16,641 vertex)를 재사용해야 DEM 해상도 재현 가능.
 
+### Globe Antimeridian Wrap 처리 주의
+
+`map.coveringTiles()`와 `terrain.tileManager.getRenderableTiles()`는 globe 모드에서 antimeridian 근처 canonical 타일에 `wrap=±1`을 의도적으로 할당하여 반환한다. 근거:
+
+- `GlobeCoveringTilesDetailsProvider.allowWorldCopies(): false` (`globe_covering_tiles_details_provider.ts:104-106`) — 인공적 world copy 루프 미실행
+- `GlobeCoveringTilesDetailsProvider.getWrap()` (`globe_covering_tiles_details_provider.ts:83-98`) — camera center 최근접 wrap(0/±1) 동적 할당
+- `TerrainTileManager.update()` (`terrain_tile_manager.ts:91-118`) — 반환된 tileID를 그대로 저장
+
+Globe 셰이더는 `spherical.x = mercator_pos.x * PI * 2.0 + PI`의 2π 주기로 wrap을 흡수하므로 최종 픽셀 결과는 wrap 값에 무관. 그러나 **render 자체가 skip되면 해당 canonical 영역이 비어버린다**. Arch 1/2는 painter 내부가 이를 자동 처리하므로 영향 없음. Arch 4만 사용자 render 루프에서 `wrap !== 0` 필터를 걸지 않도록 주의 필요. 상세: [Arch 4 — Globe Antimeridian Wrap 처리](../architectures/arch-4-customlayer-terrain-mesh.md#globe-antimeridian-wrap-처리), [FAQ Q28](../faq.md#q28-globe에서-날짜-변경선antimeridian-근처-타일이-비어-보이는-이유).
+
 ### Globe 전환 애니메이션 (transitionState 중간값)
 
 - 두 행렬 보간이 자동 수행됨

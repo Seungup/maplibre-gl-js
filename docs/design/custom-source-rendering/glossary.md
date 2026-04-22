@@ -92,6 +92,20 @@ CustomLayer의 `render(gl, args)`에서 `args.shaderData.vertexShaderPrelude`로
 **projectTileFor3D**
 셰이더 prelude 함수. `(vec2 posInTile, float elevation) → vec4 clipSpace`. mercator에서는 `projectTileWithElevation`과 동일, globe에서는 구면 투영 + elevation 오프셋 적용. Terrain drape 렌더링의 표준 함수.
 
+## CoveringTiles details provider
+
+**getWrap (details provider 메서드)**
+각 canonical 타일에 할당할 wrap 값을 결정. 시그니처: `getWrap(centerCoord, tileID, parentWrap): number`. `covering_tiles.ts:262`에서 traversal 중 타일별로 호출되어 결과 `OverscaledTileID`의 wrap을 결정.
+- **Globe** (`globe_covering_tiles_details_provider.ts:83-98`): camera center와 타일 사이 거리 최소가 되는 wrap(0, -1, +1 중 하나) 반환. `parentWrap` 무시. Antimeridian 근처 canonical 타일이 camera 위치에 따라 wrap=±1을 받는다.
+- **Mercator** (`mercator_covering_tiles_details_provider.ts:22-28`): `parentWrap`을 그대로 계승 (root에서 세팅된 wrap이 자식에게 전파).
+
+**allowWorldCopies (details provider 메서드)**
+`coveringTiles`가 인공적 world copy 루트(wrap ∈ {-3..+3})를 stack에 푸시할지 결정. `covering_tiles.ts:218-224`에서 `transform.renderWorldCopies && detailsProvider.allowWorldCopies()` 조건으로 검사.
+- **Mercator**: `true` → `renderWorldCopies`가 켜져 있을 때 3 copy 루트 추가.
+- **Globe** (`globe_covering_tiles_details_provider.ts:104-106`): `false` → 단일 wrap=0 루트만 사용. 대신 `getWrap`이 타일별로 적절한 wrap 동적 할당.
+
+이 두 메서드 조합으로 globe에서 antimeridian 근처 canonical 타일이 `wrap=±1`을 가진 `OverscaledTileID`로 반환된다. Arch 4 render 루프에서 `wrap !== 0` 필터를 걸면 이 타일이 누락되어 날짜 변경선 영역이 비어버린다. ([Arch 4 — Globe Antimeridian Wrap 처리](architectures/arch-4-customlayer-terrain-mesh.md#globe-antimeridian-wrap-처리), [FAQ Q28](faq.md#q28-globe에서-날짜-변경선antimeridian-근처-타일이-비어-보이는-이유))
+
 ## 빌드·타입
 
 **@internal**

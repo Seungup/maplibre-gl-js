@@ -259,6 +259,24 @@ MapLibre가 WebGPU 백엔드를 도입하면 `Texture`/`Context` 추상화가 �
 
 **관련**: [Arch 4 Mesh 선택 가이드](architectures/arch-4-customlayer-terrain-mesh.md#mesh-선택-가이드--중요--vertex-밀도-차이)
 
+### Q28. Globe에서 날짜 변경선(antimeridian) 근처 타일이 비어 보이는 이유?
+
+Arch 4 render 루프에 `if (isGlobe && tileID.wrap !== 0) continue` 같은 필터가 있으면 그 현상이 나타난다.
+
+**원인**: `map.coveringTiles()` 및 `terrain.tileManager.getRenderableTiles()`는 globe 모드에서 antimeridian 근처 canonical 타일에 **`wrap=±1`을 의도적으로 할당하여 반환한다**. 근거:
+
+- `GlobeCoveringTilesDetailsProvider.allowWorldCopies()` → `false` (`globe_covering_tiles_details_provider.ts:104-106`)
+  - 인공적 world copy 루프(wrap ∈ {-3..+3})를 **실행하지 않음**. 단일 wrap=0 root에서만 traversal 시작.
+- `GlobeCoveringTilesDetailsProvider.getWrap(centerCoord, tileID, _parentWrap)` → 각 canonical 타일에 camera center 최근접 wrap(0/±1) 반환 (`globe_covering_tiles_details_provider.ts:83-98`)
+- `covering_tiles.ts:262`에서 traversal 중 `it.wrap`을 해당 값으로 재할당하여 결과 `OverscaledTileID`에 반영
+- `TerrainTileManager.update()`는 이 결과를 그대로 `_renderableTilesKeys`에 저장 (`terrain_tile_manager.ts:91-118`)
+
+Globe 셰이더(`_projection_globe.vertex.glsl:47-54`)는 `spherical.x = mercator_pos.x * PI * 2.0 + PI`로 mercator→sphere 투영하는데 2π 주기 삼각함수에 들어가므로 wrap=0과 wrap=+1은 동일 sphere 위치로 그려진다. **render 자체가 skip되면 해당 canonical 영역의 픽셀이 비어버린다.**
+
+**해결**: render 루프에서 wrap 필터 제거. 공식 예제 `add-a-custom-layer-with-tiles-to-a-globe.html`의 `wrap !== 0` skip은 **static tile list** (wrap={-1,0,+1} 3 copy 자체 생성) 맥락에서만 옳으며, API 반환 타일에는 적용하면 안 됨.
+
+**관련**: [Arch 4 — Globe Antimeridian Wrap 처리](architectures/arch-4-customlayer-terrain-mesh.md#globe-antimeridian-wrap-처리)
+
 ---
 
 **See also**: [README](README.md) · [Glossary](glossary.md)

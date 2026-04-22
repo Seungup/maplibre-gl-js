@@ -152,7 +152,9 @@ const layer = {
     const tiles = this.map.coveringTiles({tileSize: 512});
 
     for (const tileID of tiles) {
-      if (isGlobe && tileID.wrap !== 0) continue;
+      // `map.coveringTiles()`는 globe 모드에서 antimeridian 타일에
+      // 의도적으로 wrap=±1을 할당한다 (GlobeCoveringTilesDetailsProvider.getWrap).
+      // 필터링하면 날짜 변경선 영역 타일이 누락되므로 wrap !== 0 필터를 걸지 말 것.
 
       const proj = this.map.transform.getProjectionData({
         overscaledTileID: tileID,
@@ -325,7 +327,9 @@ render(gl, args) {
 
   for (const tile of terrain.tileManager.getRenderableTiles()) {
     const tileID = tile.tileID;
-    if (isGlobe && tileID.wrap !== 0) continue;
+    // `terrain.tileManager.getRenderableTiles()`는 내부적으로 `coveringTiles`를
+    // 호출하며, globe 모드에서 antimeridian 타일에 wrap=±1을 할당하여 반환한다.
+    // 필터링하면 날짜 변경선 영역이 누락되므로 wrap !== 0 필터를 걸지 말 것.
 
     const mesh = terrain.getTerrainMesh(tileID);
     const td = terrain.getTerrainData(tileID);
@@ -397,6 +401,92 @@ const uniforms = [
   'u_projection_tile_mercator_coords',
 ];
 ```
+
+## Globe Antimeridian Wrap 처리
+
+Globe 모드에서 `map.coveringTiles()` 및 `terrain.tileManager.getRenderableTiles()`는 **antimeridian 근처 타일에 `wrap=±1`을 의도적으로 할당**하여 반환한다. 이는 버그가 아니라 정상 동작이며, 사용자 render 루프에서 임의로 필터링하면 날짜 변경선 영역이 렌더되지 않아 "구멍"이 생긴다.
+
+### 메커니즘
+
+`GlobeCoveringTilesDetailsProvider` (`src/geo/projection/globe_covering_tiles_details_provider.ts`)의 두 특성이 조합되어 이 동작을 만든다.
+
+**`allowWorldCopies(): false`** (line 104-106):
+
+```ts
+allowWorldCopies(): boolean {
+    return false;
+}
+```
+
+`covering_tiles.ts:218-226`의 인공적 world copy 루프(`wrap ∈ {-3..+3}`)가 **실행되지 않는다**. Globe traversal은 단일 `newRootTile(0)`에서만 시작. Mercator의 `renderWorldCopies` 패턴과 다름.
+
+**`getWrap(centerCoord, tileID, _parentWrap)`** (line 83-98):
+
+```ts
+const distanceCurrent = distanceToTileSimple(centerCoord.x, tileX, tileMercatorSize);
+const distanceLeft    = distanceToTileSimple(centerCoord.x, tileX - 1.0, tileMercatorSize);
+const distanceRight   = distanceToTileSimple(centerCoord.x, tileX + 1.0, tileMercatorSize);
+const distanceSmallest = Math.min(distanceCurrent, distanceLeft, distanceRight);
+if (distanceSmallest === distanceRight) return 1;
+if (distanceSmallest === distanceLeft) return -1;
+return 0;
+```
+
+각 canonical 타일에 대해 **camera center 기준 최근접 wrap** (0, -1, +1 중 하나)을 반환. `covering_tiles.ts:262` `it.wrap = detailsProvider.getWrap(...)`로 OverscaledTileID에 반영된다 (`_parentWrap`은 globe에서 무시).
+
+### 시나리오 예시
+
+카메라가 lng=170° 부근, 카메라 center mercator x≈0.944:
+
+- Canonical tile `{z: 2, x: 0}` (lng ≈ -180° 근처, antimeridian 동쪽에 위치)
+- `distanceCurrent = 0.694`, `distanceLeft = 1.694`, **`distanceRight = 0.056`**
+- `getWrap` 반환 = `+1` → `OverscaledTileID(z=2, wrap=+1, x=0, ...)`
+- TerrainTileManager는 이를 `tileID.key`(wrap 포함)로 저장. `getRenderableTiles()`도 이 wrap=+1 타일을 포함해 반환.
+
+만약 사용자 render 루프가 `if (isGlobe && tileID.wrap !== 0) continue`로 필터링하면 이 타일이 skip되어 lng≈±180° 경계 영역의 픽셀이 비게 된다.
+
+### Globe 셰이더의 wrap 불변성
+
+`_projection_globe.vertex.glsl:47-54`:
+
+```glsl
+vec2 mercator_pos = u_projection_tile_mercator_coords.xy
+                  + u_projection_tile_mercator_coords.zw * translatedPos;
+vec2 spherical;
+spherical.x = mercator_pos.x * PI * 2.0 + PI;
+```
+
+`spherical.x`는 2π 주기 삼각함수로 들어가므로 mercator x=0과 x=1은 동일 sphere 위치(antimeridian)로 투영된다. **같은 canonical 타일을 wrap=0 또는 wrap=+1로 그려도 최종 픽셀은 동일하다.** 단 render 자체가 빠지면 해당 canonical 영역은 채워지지 않는다.
+
+### 공식 예제와의 차이
+
+`test/examples/add-a-custom-layer-with-tiles-to-a-globe.html:72-76`는 `coveringTiles` API를 쓰지 않고 **static하게** 3-copy(wrap={-1,0,+1})를 직접 생성한다:
+
+```js
+for (let i = -1; i <= 1; i++) {
+    generateTileList(tilesToRender, {x: 0, y: 0, z: 0, wrap: i});
+}
+```
+
+이 static list 맥락에서는 mercator는 3 copy 모두, globe는 중복이므로 `wrap !== 0` skip이 옳다.
+
+**그러나 `coveringTiles` 또는 `terrain.tileManager.getRenderableTiles()` API의 반환값에는 이 필터가 오동작을 일으킨다.** API가 이미 globe 중복 방지(`allowWorldCopies: false`)를 끝낸 뒤 wrap을 의도적으로 할당한 것이므로 추가 필터링은 잘못된 제거가 된다.
+
+### 선택적 중복 방지 (canonical 단위 dedup)
+
+`coveringTiles`와 `getRenderableTiles`는 이미 canonical 단위 중복을 제거하므로 일반적인 경우 안전 장치는 불필요하다. 방어적 코드가 필요하다면 canonical 단위로 dedup한다:
+
+```js
+const seen = new Set();
+for (const tileID of tiles) {
+  const canonKey = `${tileID.canonical.z}/${tileID.canonical.x}/${tileID.canonical.y}`;
+  if (seen.has(canonKey)) continue;
+  seen.add(canonKey);
+  // draw
+}
+```
+
+`wrap !== 0` 기반 필터는 절대 사용하지 말 것.
 
 ## Terrain Elevation 확장
 
