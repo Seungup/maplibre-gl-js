@@ -1006,97 +1006,124 @@ map.setTerrain({source: 'dem', exaggeration: 1.5});   // 자동 drape
 
 ---
 
-## 글로브 프로젝션 + 지형 — MapLibre의 처리 방식 (★ 중요)
+## 글로브 프로젝션 + 지형 — MapLibre의 처리 방식
 
-"globe projection 환경에서 terrain이 함께 활성화되면 벡터 데이터는 어떻게 렌더되는가?"라는 질문의 답은 예상 밖이다: **MapLibre는 이 조합을 근본적으로 지원하지 않는다.** 두 렌더링 모드는 **상호 배타적(mutually exclusive)**이며, 이는 벡터든 raster든 본 설계의 Architecture 1/2 모두에 동일하게 적용되는 코어 제약이다.
+> **정정 노트**: 본 섹션의 초기 버전은 "globe + terrain은 상호 배타적"이라고 잘못 기술했었다. 실제로는 **globe + terrain이 정상 동작**하며, MapLibre는 layered architecture로 두 모드를 결합한다. 아래는 실제 코드를 재검증한 결과이다.
 
-### 코드 레벨 증거
+### 실제 동작 메커니즘 — Layered Rendering
 
-| 위치 | 내용 |
-|---|---|
-| `src/render/painter.ts:488` | `isRenderingGlobe: style.projection?.transitionState > 0` — globe 트랜지션 진행 중일 때만 globe 렌더 활성화 |
-| `src/render/painter.ts:583-585` | `if (renderOptions.isRenderingGlobe && !this.style.map.terrain) { …render globe depth… }` — **globe sphere depth는 terrain이 비활성일 때만 기록됨** |
-| `src/render/painter.ts:584` (주석) | `// There should be no need for explicitly writing tile depths when terrain is enabled.` |
-| `src/geo/projection/vertical_perspective_transform.ts:341` (주석) | `// elevation is assumed to be zero - globe rendering must be separate from terrain rendering anyway` |
-| `src/webgl/draw/draw_line.ts:206` | `applyGlobeMatrix: !isRenderingToTexture` — RTT 중에는 globe 행렬 적용 불가 |
-| `src/webgl/draw/draw_fill.ts:112` | 동일 (`applyGlobeMatrix: !isRenderingToTexture`) |
+globe와 terrain은 함께 활성화될 때 **다음과 같은 두 단계 구조**로 작동한다:
 
-### 왜 공존이 불가능한가 — 기하학적 모순
+**Stage 1 — RTT pass (mercator 평면 합성)**:
 
-- **Globe projection의 가정**: 세계 좌표를 구 표면으로 투영 (`_projection_globe.vertex.glsl:46-76`). `projectTile()`이 mercator(x,y) → 구면각 → 3D 구 표면 좌표 → 스크린 NDC로 변환. **elevation = 0 가정**.
-- **Terrain의 가정**: 평면 mercator 평면에 DEM texture 샘플링으로 z축 변위. Per-fragment elevation lookup. **구면이 아닌 평면 기반**.
+```ts
+// src/webgl/draw/draw_line.ts:206
+applyGlobeMatrix: !isRenderingToTexture,
+applyTerrainMatrix: true
+// src/webgl/draw/draw_fill.ts:112  동일
+```
 
-두 모델이 서로 다른 기하학적 전제에서 출발하므로 한쪽이 활성화되면 다른 쪽 수학이 깨진다. 예: terrain은 "이 (x,y) 위치의 고도" 개념이지만 globe에서 (x,y)는 이미 구면각이라 "고도"의 의미가 달라진다.
+- RTT 중에는 `applyGlobeMatrix = false` → line/fill이 **mercator 행렬**로 per-tile FBO에 기록
+- 결과: 타일 FBO에 평면 mercator-투영된 벡터 픽셀이 저장됨
+- 이 시점에는 globe도 terrain elevation도 적용되지 않음 — 순수 mercator 타일 텍스처
 
-### 현재의 렌더링 동작 (globe 활성 시)
+**Stage 2 — `drawTerrain`이 terrain mesh를 globe 투영 + elevation으로 그림**:
 
-`applyGlobeMatrix: !isRenderingToTexture`의 의미를 사례별로 해석:
+```ts
+// src/webgl/draw/draw_terrain.ts:93 (★ 핵심)
+const projectionData = tr.getProjectionData({
+  overscaledTileID: tile.tileID,
+  applyTerrainMatrix: false,   // terrain mesh 자체가 elevation을 가짐
+  applyGlobeMatrix: true        // ← terrain mesh를 globe 좌표계로 투영
+});
+program.draw(context, gl.TRIANGLES, depthMode, StencilMode.disabled, colorMode,
+             CullFaceMode.backCCW, uniformValues, terrainData, projectionData,
+             'terrain', mesh.vertexBuffer, mesh.indexBuffer, mesh.segments);
+```
 
-1. **Terrain OFF + Globe OFF** (표준 mercator):
-   - RTT 발생하지 않음 → `isRenderingToTexture = false`
-   - `applyGlobeMatrix = true`이지만 globe도 비활성이라 무의미
-   - → 일반 mercator 경로
+- terrain mesh의 정점은 DEM에서 가져온 **elevation 값**을 가짐
+- 이 mesh를 **globe projection으로 투영** → 구면 + 고도 굴곡이 있는 표면 생성
+- Stage 1에서 만든 RTT 텍스처(mercator 평면)를 **텍스처로 sampling**해서 mesh 표면에 입힘
+- 결과: **구면 위에 elevation이 있는 표면 + 그 위에 drape된 벡터** = globe + terrain의 시각적 결과
 
-2. **Terrain ON + Globe OFF** (mercator + 3D terrain):
-   - line/fill/raster 레이어가 RTT FBO에 기록 → `isRenderingToTexture = true`
-   - `applyGlobeMatrix = false` → mercator 행렬로 RTT 그림
-   - drawTerrain이 RTT 텍스처를 elevation에 drape
-   - → **본 설계(Architecture 1/2)가 정상 작동하는 표준 시나리오**
+### 왜 이 구조가 자연스럽게 작동하는가
 
-3. **Terrain OFF + Globe ON** (구 위의 flat vectors):
-   - RTT 없음 → `isRenderingToTexture = false`
-   - `applyGlobeMatrix = true` → globe 행렬로 직접 draw
-   - shader의 `projectTile()`이 구면 투영, `projectLineThickness()`가 위도 보정
-   - → 벡터 정상 렌더, 단 elevation 없음
+- 타일 텍스처는 **본질적으로 평면 [0..tileSize]² 픽셀 격자**다. 어떤 projection이든 타일 단위로 잘게 나뉘면 각 타일 내부는 거의 평면이라고 근사할 수 있다.
+- RTT는 그 평면 텍스처를 만든다. globe 여부와 무관.
+- 최종 합성 단계에서 mesh를 어떻게 투영할지(mercator? globe?)에 따라 그 평면 텍스처가 평면에 펼쳐지거나 구면에 휘감긴다.
+- 즉 **"per-tile 평면 텍스처 + projection-aware mesh"** 의 분리가 globe + terrain 공존을 가능하게 한다.
 
-4. **Terrain ON + Globe ON** (모순):
-   - `painter.ts:585`의 guard: `if (isRenderingGlobe && !terrain)` — globe depth 기록 생략
-   - 실질적으로 terrain이 우선하고 globe 수학은 부분 비활성화
-   - **지원되지 않는 상태 — 시각적 결과 미정의**
+### `painter.ts:583-585`와 `vertical_perspective_transform.ts:341`의 실제 의미
 
-### Globe 단독 모드에서 1px 정밀도 유지 방식
+이전 분석에서 잘못 인용한 두 코드를 정확히 재해석하면:
 
-터미널 모드에서 globe만 활성화된 경우(시나리오 3), 벡터 렌더링 품질은 어떻게 유지되는가? 이는 Architecture 2의 GPU 셰이더 매커니즘이 projection-agnostic하게 설계된 덕분이다.
+**`painter.ts:583-585`**:
+```ts
+// Render the globe sphere into the depth buffer - but only if globe is enabled and terrain is disabled.
+// There should be no need for explicitly writing tile depths when terrain is enabled.
+if (renderOptions.isRenderingGlobe && !this.style.map.terrain) {
+    this._renderTilesDepthBuffer();
+}
+```
+- 의미: globe 단독 모드에서는 **far-side z-clipping을 위해 globe sphere를 depth buffer에 그려야** 한다
+- terrain이 활성이면 **terrain mesh가 이미 depth 정보를 제공**하므로 sphere depth를 별도로 그릴 필요 없음
+- 즉 두 모드를 비활성화하는 것이 아니라 **terrain이 globe sphere의 depth 역할을 인계받는다**는 의미
 
-- **Projection 인터페이스**: `projectTile(vec2)`, `projectLineThickness(float)`, `projectTileWithElevation(vec3)` 시그니처가 mercator/globe 셰이더에서 공통 (`_projection_mercator.vertex.glsl`, `_projection_globe.vertex.glsl`)
-- **Line thickness 위도 보정**: globe 셰이더의 `projectLineThickness(tileY) = 1.0 / cos(sphericalLatitude)` — 극지방에 가까울수록 자연스러운 수축을 보상하여 화면상 1px 유지
-- **Pole seam 방지**: 특수 Y 값으로 극점 vertex 마킹
-  - `rawPos.y < -32767.5` → 북극
-  - `rawPos.y > 32766.5` → 남극  
-  - Shader가 이를 감지해 구의 극점에 스냅 → 타일 경계 seam 제거
-- **LineBucket은 projection-독립**: `layoutVertexArray`가 [0..EXTENT] tile-local 좌표를 저장하므로 buckets는 projection이 바뀌어도 재생성 불필요. 셰이더에서만 분기.
+**`vertical_perspective_transform.ts:341`** (주변 라인 320-360 컨텍스트):
+- 카메라→globe 중심 거리(camera-to-globe-center distance)를 계산하는 **수학 블록 내부**의 주석
+- 이 특정 계산에서 elevation=0으로 가정한다는 뜻 (수평선 클리핑 plane 결정용)
+- 전체 시스템에서 elevation을 무시한다는 뜻이 아님
 
-결과: Architecture 2의 bucket은 mercator든 globe든 동일하게 쓸 수 있고, line 셰이더가 projection별로 `projectTile`만 바꿔 호출한다. Tile LOD 독립 1px 정밀도는 두 projection 모두에서 보장된다.
+### 사용자의 질문에 대한 정확한 답변
 
-### Architecture 1/2에 대한 함의
+> "정확히는 vertical perspective projection을 지원하는 건가요?"
+
+**그렇다.** MapLibre의 "globe" 모드는 내부적으로 **`VerticalPerspectiveProjection` / `VerticalPerspectiveTransform`** 으로 구현되어 있다.
+
+- `src/geo/projection/globe_projection.ts`의 `GlobeProjection`은 `transitionState`(0~1)에 따라 `MercatorProjection`과 `VerticalPerspectiveProjection`을 **위임**하는 facade
+- transitionState=0: 순수 mercator
+- transitionState=1: 순수 vertical perspective (구면 투영)
+- 0 < transitionState < 1: 두 행렬을 보간 (globe ↔ flat 전환 애니메이션)
+
+`drawTerrain`의 `applyGlobeMatrix: true`는 결과적으로 이 vertical perspective transform 행렬을 mesh 정점에 적용하는 것이다.
+
+### Architecture 1/2에 대한 함의 (수정)
 
 | 시나리오 | Architecture 1 (Custom Raster) | Architecture 2 (Custom Vector Bucket) |
 |---|---|---|
-| Mercator + Terrain | O — `prepare()` FBO → raster RTT → drape | O — bucket + line RTT → drape |
+| Mercator + Terrain | O | O |
 | Mercator 단독 | O | O |
-| Globe 단독 | △ — `prepare()`에서 FBO는 mercator 타일 단위로 생성 가능하지만, raster 레이어의 globe 샘플링이 왜곡될 수 있음. `drawRaster`의 globe 처리 확인 필요 | O — 내장 line 레이어가 globe 셰이더 분기를 처리하므로 자동 |
-| Globe + Terrain | **X (MapLibre 전체 제약)** | **X (MapLibre 전체 제약)** |
+| Globe 단독 | O — `prepare()` FBO는 mercator 평면 텍스처, 최종 draw에서 globe 투영. 단 극지방 텍스처 stretching 주의 | O — bucket이 globe 셰이더 분기로 직접 globe 투영 |
+| **Globe + Terrain** | **O — RTT FBO(mercator 평면 텍스처) + terrain mesh가 globe로 투영 + DEM elevation 적용** | **O — bucket이 line 셰이더로 RTT FBO에 그려지고, terrain mesh가 globe + elevation으로 합성** |
 
-**결론**: 본 설계의 두 Architecture 모두 "globe + terrain 동시"를 극복할 수 없다 — 이는 MapLibre 코어의 근본 제약이기 때문이다. 벡터 소스가 해결한 것은 **"mercator + terrain"** 조합에서의 정확한 1px drape뿐이며, **"globe + terrain"은 MapLibre 자체가 미지원** 영역이다.
+**Architecture 1의 globe + terrain 구체적 흐름**:
+1. Source `prepare()`: mercator 타일 좌표계에서 FBO에 사용자 벡터 래스터화 → `tile.texture`
+2. `drawRaster` (RTT 중): `applyGlobeMatrix: false`로 mercator 평면 RTT FBO에 텍스처 쿼드 복사
+3. `drawTerrain`: `applyGlobeMatrix: true` + DEM elevation으로 terrain mesh 투영, RTT FBO를 텍스처로 사용
+4. 결과: 구면 elevation 표면에 사용자 벡터가 정확히 drape
 
-### Globe 단독 시 Architecture 1의 추가 고려사항
+**Architecture 2의 globe + terrain 구체적 흐름**:
+1. Source `loadTile()`: `tile.buckets`에 LineBucket 생성 (mercator tile-local 좌표 [0..EXTENT])
+2. `drawLine` (RTT 중): `applyGlobeMatrix: false`로 mercator 셰이더로 RTT FBO에 라인 그림
+3. `drawTerrain`: 위와 동일
+4. 결과: globe + terrain 위에 픽셀 완벽한 1px 라인
 
-시나리오 3(terrain OFF + globe ON)에서 Architecture 1을 사용할 때 체크포인트:
+### Architecture 1의 globe-only 모드 추가 고려사항
 
-- `prepare()`가 mercator 타일 좌표계에서 FBO를 만드는 것은 문제없음 — tile.texture는 본질적으로 tile-local [0..tileSize] 평면 텍스처
-- `drawRaster`가 globe 렌더 시 `applyGlobeMatrix: true`로 동작하므로 텍스처 쿼드가 구면에 투영됨
-- **단, 텍스처 mapping이 구의 곡면에 펴질 때 LINEAR 필터링의 pole-area distortion이 발생**. mercator→구면 변환은 극지방에서 심하게 왜곡되므로 Architecture 1의 raster 텍스처는 저위도 대비 고위도에서 해상도 손실이 커진다.
-- Architecture 2(bucket)는 geometry 자체를 globe 셰이더에서 re-project하므로 이 문제가 없음.
+terrain이 꺼지고 globe만 활성화된 경우(시나리오 "Globe 단독"):
 
-### 글로브 + 고도 효과가 꼭 필요하다면 (워크어라운드)
+- RTT 발생하지 않음 → `isRenderingToTexture = false` → `applyGlobeMatrix = true`
+- `drawRaster`가 globe 행렬을 직접 적용해 텍스처 쿼드를 구면에 그림
+- `tile.texture`는 mercator 평면이지만 mesh quad는 globe 셰이더의 `projectTile()`로 구면에 매핑됨
+- **위험**: 극지방에서 mercator 텍스처는 비선형으로 늘어나 있어 globe로 다시 매핑할 때 **샘플링 왜곡**이 누적된다. 저위도는 거의 무손실, 고위도는 LINEAR 필터 한계로 흐려짐
+- Architecture 2는 geometry 자체를 globe 셰이더로 re-project하므로 이 문제 없음
 
-MapLibre 코어 수정 없이 globe에서 "고도 있는 것처럼 보이는" 시각화가 필요하다면:
+### 정리
 
-1. **CustomLayer + 자체 3D 구 + 자체 elevation sampling** (RTT 미사용) — CustomLayer가 globe projection matrix를 직접 받아 구 위에 3D geometry를 그리되 terrain drape는 자체 구현. 단 MapLibre 터레인 DEM 활용 불가.
-2. **Terrain OFF 유지 + 색/셰이딩으로 고도 표현** — 벡터 데이터에 고도 속성을 attribute로 심고 line-color를 고도 함수로 표현. 실제 3D 변위는 없지만 시각적으로 고도감 표현.
-3. **Projection 전환** — UX에서 "flat 모드(mercator+terrain)" / "globe 모드(terrain 없음)" 두 모드를 제공하고 사용자가 선택.
-
-이상의 워크어라운드는 본 설계의 스코프를 벗어나므로 참고용 언급만 한다.
+- globe + terrain은 **MapLibre가 정상 지원**하는 조합이다
+- 핵심 메커니즘: **RTT는 mercator 평면 텍스처 생성**, **drawTerrain은 globe + elevation으로 mesh 투영하여 텍스처 sampling**
+- 본 설계의 Architecture 1/2 모두 이 layered 구조 안에서 자연스럽게 동작한다 (특별 처리 불필요)
+- "globe"의 정확한 구현체는 `VerticalPerspectiveProjection` / `VerticalPerspectiveTransform`이며, `GlobeProjection`은 mercator ↔ vertical perspective 사이의 transition을 관리하는 facade이다
 
 ---
 
