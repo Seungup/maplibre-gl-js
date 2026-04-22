@@ -545,15 +545,75 @@ void main() {
 
 Polygon offset과 동등하지만 셰이더 내부에서 제어하므로 GL 상태 오염 없음.
 
+#### (4) Depth Replacement — 근본 해결
+
+`terrainData.depthTexture` (MapLibre가 매 프레임 pre-render한 terrain depth framebuffer, `terrain.ts:310`)를 custom shader에서 직접 샘플링하고 `gl_FragDepth`로 override하여 **base terrain과 bit-identical depth**를 강제. Floating-point drift에 관계없이 `LEQUAL` 테스트가 항상 통과하므로 z-fighting 원천 제거.
+
+**Fragment shader**:
+```glsl
+uniform highp sampler2D u_depth;
+uniform vec2 u_viewport;   // logical pixel size
+
+// _prelude.vertex.glsl:104-106에서 복제
+highp float unpack(highp vec4 color) {
+  const highp vec4 bitShifts = vec4(
+    1.0 / (256.0 * 256.0 * 256.0),
+    1.0 / (256.0 * 256.0),
+    1.0 / 256.0,
+    1.0
+  );
+  return dot(color, bitShifts);
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_viewport;
+  highp float terrainDepth = unpack(texture(u_depth, uv));
+  gl_FragDepth = terrainDepth;   // base terrain과 동일 depth 강제
+  fragColor = computeColor();
+}
+```
+
+**Render 루프 바인딩**:
+```js
+const td = terrain.getTerrainData(tileID);
+
+gl.activeTexture(gl.TEXTURE0 + 3);
+gl.bindTexture(gl.TEXTURE_2D, td.depthTexture);
+gl.uniform1i(locations.u_depth, 3);
+
+const dpr = window.devicePixelRatio || 1;
+gl.uniform2f(locations.u_viewport, gl.canvas.width / dpr, gl.canvas.height / dpr);
+```
+
+**동작 원리**:
+- `drawDepth` (`src/webgl/draw/draw_terrain.ts:16-36`)가 매 프레임 terrain mesh 깊이를 FBO에 RGBA packed 형태로 기록
+- FBO 해상도: `painter.width/height ÷ devicePixelRatio` (logical pixels, `terrain.ts:322-323`)
+- Custom fragment가 같은 screen 위치에서 이 값을 unpack해 `gl_FragDepth`로 사용
+- 결과: 두 draw가 **동일 픽셀에서 정확히 같은 depth** → `LEQUAL` 항상 통과
+
+**특성**:
+- `gl_FragDepth` 쓰기로 early-Z 최적화 비활성화 → 소폭 성능 저하 (대부분 무시할 수준)
+- 다른 3D geometry와의 상호 폐색은 terrain depth에 묶임 → "terrain 표면에 완전히 정렬된 drape" 용도에 최적
+- Skirt 영역도 base terrain의 depth를 그대로 사용하므로 올바르게 처리됨
+- `u_depth` 텍스처는 terrain이 활성일 때만 유효 (`terrainData.depthTexture`가 없으면 `_emptyDepthTexture` 반환)
+
+#### 방법 비교
+
+| 방법 | z-fight 해결 방식 | 정확한 depth | early-Z | skirt 커버 |
+|---|---|---|---|---|
+| (1) Polygon Offset | 바이어스 (살짝 앞) | 아님 | 유지 | O |
+| (2) Skip Skirt | 렌더 회피 | 해당 없음 | 유지 | X (base terrain이 채움) |
+| (3) Shader Bias | 바이어스 (살짝 앞) | 아님 | 유지 | O |
+| (4) Depth Replacement | **bit-identical 강제** | **정확** | 비활성 | O |
+
 #### 선택 가이드
 
-| 상황 | 권장 |
-|---|---|
-| 반투명 overlay | **Skirt 생략** — 가장 깔끔, 성능↑ |
-| 불투명 overlay 또는 타일 LOD seam 민감 | **Polygon Offset** |
-| GL 상태 격리 필요 (예: 다른 custom layer와 상태 공유 우려) | **Shader Bias** |
+- **정확한 표면 정렬이 중요** (예: 지형 표면에 정확히 painting되는 overlay): **(4) Depth Replacement**
+- **반투명 overlay** (skirt는 base terrain이 채우면 됨): **(2) Skip Skirt** — 간결, 성능↑
+- **불투명 overlay 또는 LOD seam 민감**: **(1) Polygon Offset** — 1줄로 해결
+- **GL 상태 격리 필요**: **(3) Shader Bias**
 
-**권장 폐기**: `gl.disable(gl.DEPTH_TEST)` — 지형 뒷면 폐색을 무시해 반구 뒷부분이 앞으로 나오는 등 globe에서 특히 부적합.
+**권장 폐기**: `gl.disable(gl.DEPTH_TEST)` — 지형 뒷면 폐색 무시됨. Globe에서 반구 뒤쪽이 앞으로 튀어나옴.
 
 ## Terrain Elevation 확장
 

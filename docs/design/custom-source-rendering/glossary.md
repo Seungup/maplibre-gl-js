@@ -86,6 +86,9 @@ Terrain mesh vertex의 3번째 컴포넌트. 값 `0`이면 메인 vertex, `1`이
 **getMeshFrameDelta(zoom)**
 `2 * PI * earthRadius / 2^zoom / 5`. Frame vertex를 아래로 내리는 높이(미터 단위). 정의: `src/render/terrain.ts:505-508`. 줌이 높아질수록 작아짐(타일이 작아져서 필요한 offset도 감소).
 
+**terrainData.depthTexture**
+`terrain.getTerrainData(tileID)` 반환 객체의 `depthTexture` 필드 (`terrain.ts:310`). MapLibre가 매 프레임 `drawDepth` (`draw_terrain.ts:16-36`)에서 terrain mesh 깊이를 RGBA packed로 기록한 screen-size framebuffer의 텍스처. 해상도는 `painter.width/height ÷ devicePixelRatio` (logical pixels). Custom shader에서 이 값을 `unpack()`으로 float depth로 풀어 `gl_FragDepth`에 대입하면 base terrain과 bit-identical depth를 강제할 수 있음 — Arch 4 패턴 2의 skirt z-fighting 근본 해결에 사용. 참고: `_prelude.vertex.glsl:104-106` `unpack()`, `_prelude.vertex.glsl:108-118` `depthOpacity()` (MapLibre 내부 terrain-aware 가시성 판정 용례).
+
 **vertexShaderPrelude**
 CustomLayer의 `render(gl, args)`에서 `args.shaderData.vertexShaderPrelude`로 접근. 현재 projection에 맞는 `projectTile`/`projectTileFor3D`/`projectLineThickness` 등 함수를 셰이더에 자동 제공. mercator/globe 분기 불필요. 생성 지점: `src/webgl/draw/draw_custom.ts:26`.
 

@@ -284,8 +284,9 @@ Globe 셰이더(`_projection_globe.vertex.glsl:47-54`)는 `spherical.x = mercato
 Base terrain과 Arch 4 CustomLayer가 **같은 terrain mesh를 두 번 렌더**(같은 `LEQUAL`/`ReadWrite` depth mode)하기 때문. 메인 grid는 완만한 경사라 floating-point drift가 덮여 보이지 않지만, skirt 벽은 뷰 방향과 거의 평행한 수직면이라 미세 drift가 flicker로 즉시 드러난다.
 
 **해결책** (상황별 선택):
+- **(근본) Depth Replacement**: `terrainData.depthTexture`를 샘플링하여 `gl_FragDepth = unpack(texture(u_depth, uv))`로 override. Base terrain과 bit-identical depth 강제 → floating-point drift 무관하게 `LEQUAL` 항상 통과. 정확한 표면 정렬이 필요한 용도 (`terrain.ts:310`의 `depthTexture`, `draw_terrain.ts:16-36`의 `drawDepth` pre-render 활용).
 - **반투명 overlay → Skirt 생략 draw**: `gl.drawElements(gl.TRIANGLES, 128*128*2*3, gl.UNSIGNED_SHORT, 0)` — 메인 grid만 그림. 기본 terrain이 skirt를 그리므로 coverage 유지.
-- **불투명 overlay → Polygon Offset**: `gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(-1, -1);` — 표준 GL 기법.
+- **불투명 overlay → Polygon Offset**: `gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(-1, -1);` — 표준 GL 바이어스 기법.
 - **GL 상태 격리 필요 → Shader Bias**: vertex shader 말미에 `gl_Position.z -= 0.0001 * gl_Position.w;`
 
 상세: [Arch 4 — Skirt Z-Fighting 대응](architectures/arch-4-customlayer-terrain-mesh.md#skirt-z-fighting-대응)
