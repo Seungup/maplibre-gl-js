@@ -1127,6 +1127,179 @@ terrain이 꺼지고 globe만 활성화된 경우(시나리오 "Globe 단독"):
 
 ---
 
+## Architecture 4 — CustomLayer + Terrain Mesh 재활용 (Mesh-Based Direct Rendering)
+
+본 설계의 지금까지 세 가지 접근은 모두 "소스가 per-tile 데이터(texture 또는 bucket)를 생성 → 내장 layer/painter 파이프라인이 렌더"라는 간접 경로였다. **사용자가 제안한 네 번째 경로**는 전혀 다른 관점에서 접근한다:
+
+> **`map.terrain.getTerrainMesh(tileID)` + `getTerrainData(tileID)` + `map.coveringTiles()`를 CustomLayer가 직접 호출하여, 기존 terrain mesh 위에 커스텀 셰이더로 한 번 더 렌더링.**
+
+기본 지도와 별개로 **동일한 mesh를 한 번 더 그리는** 구조이며, CustomLayer가 RTT에 참여하지 못하는 한계를 "내장 terrain mesh를 빌려쓰는" 방식으로 우회한다.
+
+### 공개 API로 가능함 (검증 완료)
+
+| API | 위치 | 용도 |
+|---|---|---|
+| `map.coveringTiles(options)` | `src/ui/map.ts:980` | 현재 가시 타일 ID 배열 (`OverscaledTileID[]`) |
+| `map.terrain` | `src/ui/camera.ts:259` | Terrain 인스턴스 접근 (terrain 미활성 시 null) |
+| `terrain.getTerrainMesh(tileID)` | `src/render/terrain.ts:433` | 128×128 정규 그리드 mesh (vertexBuffer, indexBuffer, segments) — 타일 간 공유 캐싱 |
+| `terrain.getTerrainData(tileID)` | `src/render/terrain.ts:264` | `{u_terrain_matrix, u_terrain_dim, u_terrain_unpack, u_terrain_exaggeration, texture, depthTexture, tile}` |
+| `terrain.tileManager.getRenderableTiles()` | `src/tile/terrain_tile_manager.ts` | terrain 기준 가시 타일 (coveringTiles와 다른 계층) |
+| `painter.context` / `gl` | CustomLayer의 render에 직접 전달 | GL 컨텍스트 직접 조작 |
+
+**Elevation 샘플링 공식**: `src/shaders/glsl/_prelude.vertex.glsl:146-166`의 `get_elevation(vec2 pos)`를 사용자 셰이더에 복제.
+
+### 구현 스켈레톤
+
+```ts
+class CustomDomainLayer implements CustomLayerInterface {
+  id = 'rail-custom';
+  type = 'custom';
+  renderingMode: '3d' = '3d';
+
+  private map!: Map;
+  private program!: WebGLProgram;
+  private uniforms!: Record<string, WebGLUniformLocation>;
+
+  onAdd(map: Map, gl: WebGL2RenderingContext) {
+    this.map = map;
+    this.program = compileShaders(gl, VERTEX_SHADER, FRAGMENT_SHADER);
+    this.uniforms = locateUniforms(gl, this.program);
+  }
+
+  render(gl: WebGL2RenderingContext, args: CustomRenderMethodInput) {
+    const terrain = this.map.terrain;
+    if (!terrain) return;                         // terrain 미활성 시 pass (또는 대체 경로)
+
+    gl.useProgram(this.program);
+
+    // ★ 핵심: terrain이 관리하는 가시 타일 순회
+    for (const tile of terrain.tileManager.getRenderableTiles()) {
+      const tileID = tile.tileID;
+      const mesh = terrain.getTerrainMesh(tileID);
+      const td = terrain.getTerrainData(tileID);
+      const proj = this.map.transform.getProjectionData({
+        overscaledTileID: tileID,
+        applyTerrainMatrix: false,   // 우리가 직접 get_elevation 호출
+        applyGlobeMatrix: true,      // globe 모드 자동 대응
+      });
+
+      // DEM 텍스처 바인딩 (터레인과 동일 슬롯 규약 따름)
+      gl.activeTexture(gl.TEXTURE0 + 2);
+      gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+      gl.uniform1i(this.uniforms.u_terrain, 2);
+      gl.uniformMatrix4fv(this.uniforms.u_terrain_matrix, false, td.u_terrain_matrix as Float32Array);
+      gl.uniform1f(this.uniforms.u_terrain_dim, td.u_terrain_dim);
+      gl.uniform4fv(this.uniforms.u_terrain_unpack, td.u_terrain_unpack);
+      gl.uniform1f(this.uniforms.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+      // Projection 유니폼 (args.defaultProjectionData와 proj 중 선택)
+      gl.uniformMatrix4fv(this.uniforms.u_projection_matrix, false, proj.mainMatrix);
+
+      // 사용자 도메인 데이터 유니폼/텍스처 바인딩
+      this.bindDomainData(gl, tileID);
+
+      // 내장 terrain mesh를 직접 그린다
+      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.SHORT, false, 8, 0);
+      gl.drawElements(gl.TRIANGLES, mesh.segments.get()[0].primitiveLength * 3, gl.UNSIGNED_SHORT, 0);
+    }
+  }
+}
+```
+
+**셰이더 예시** (도메인 데이터를 고도 위에 drape):
+
+```glsl
+// Vertex
+#version 300 es
+in vec3 a_pos3d;
+uniform mat4 u_projection_matrix;
+uniform mat4 u_terrain_matrix;
+uniform sampler2D u_terrain;
+uniform float u_terrain_dim, u_terrain_exaggeration;
+uniform vec4 u_terrain_unpack;
+out vec2 v_tileUV;
+
+// _prelude.vertex.glsl:146-166 복제
+float get_elevation(vec2 pos) {
+  vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+  // ... bilinear sample ...
+  return sampled_ele * u_terrain_exaggeration;
+}
+
+void main() {
+  float ele = get_elevation(a_pos3d.xy);
+  v_tileUV = a_pos3d.xy / 8192.0;      // EXTENT
+  gl_Position = u_projection_matrix * vec4(a_pos3d.xy, ele, 1.0);
+}
+
+// Fragment: 사용자 도메인 텍스처 샘플링 또는 절차적 렌더
+```
+
+### 이 방식의 본질적 이점
+
+1. **CustomLayer의 GLSL 자유도 + terrain drape 양립**. Architecture 1(raster)이 해결하지 못한 "텍스처 해상도 한계 없는 drape"를 달성. 셰이더가 `get_elevation`을 직접 호출하므로 per-pixel 고도 정확도.
+2. **내부 데이터 중복 없음**. terrain이 이미 만들어둔 mesh/DEM 텍스처를 참조만 함 → 메모리 추가 소비 거의 없음.
+3. **Globe 자동 대응**. `getProjectionData({applyGlobeMatrix: true})`로 얻은 projection matrix가 globe transitionState에 따라 자동으로 vertical perspective로 전환.
+4. **RTT bucket 구축 복잡도 회피**. Architecture 2의 `LineBucket` 내부 API 의존 없음.
+5. **coveringTiles 자연 활용**. 사용자가 애초에 원한 "coveringTiles 결과 기반 렌더"가 정확히 이 구조.
+
+### 제약과 주의점
+
+1. **CustomLayer는 RTT 스택에 포함되지 않음**. `drawCustom`이 translucent pass에서 호출되므로 (`src/webgl/draw/draw_custom.ts:45`), **기본 지도 terrain 컴포지팅이 끝난 뒤 그 위에 덧그려짐**. 시각적으로는 drape처럼 보이지만 z-order상:
+   - 내장 line/fill/symbol 레이어보다 뒤에 그려짐 (RTT 단계에서 먼저 합성된 뒤라)
+   - Sky/atmosphere보다는 앞
+   - → 심볼이 커스텀 렌더 위에 얹히지 않음 (depth/stencil로 조정 필요)
+2. **Terrain mesh를 두 번 래스터화**. 기본 지도가 이미 그린 mesh에 우리가 또 그리는 overdraw. 128×128 × 타일 수 정도이므로 실무상 무시 가능하지만, 고성능 요구 시 프로파일링 필요.
+3. **@internal API 의존**. `getTerrainData`, `getTerrainMesh`는 JSDoc에 `@internal`로 표시되어 있어 마이너 버전 업그레이드 시 시그니처 변경 가능성. 벤더링이나 타입 단언(`as any`) 필요.
+4. **Terrain 미활성 시 폴백 필요**. `map.terrain`이 null이면 이 경로 자체가 동작하지 않음 — 평면 렌더 대체 로직을 CustomLayer 내부에 작성해야 함 (Mercator 평면용 mesh를 자체 생성하거나, terrain.getTerrainMesh 대신 자체 정점 배열 사용).
+5. **queryRenderedFeatures 미지원**. 기존 CustomLayer와 동일한 한계.
+6. **Depth ordering 수동 관리**. 다른 RTT 레이어와의 상호작용을 사용자가 depthMask/stencil로 직접 조정해야 할 수 있음.
+
+### 네 Architecture 비교 종합
+
+| | **Arch 1 (Custom Raster)** | **Arch 2 (Custom Vector Bucket)** | **Arch 3 (CustomLayer + RTT 확장, 가설)** | **Arch 4 (CustomLayer + Terrain Mesh 재활용)** |
+|---|---|---|---|---|
+| 데이터 컨테이너 | `tile.texture` | `tile.buckets` | 없음 (core API 확장 필요) | 없음 (terrain mesh + DEM 차용) |
+| 레이어 타입 | `raster` | `line`/`fill`/`circle` 등 | `custom` + `renderToTexture` | `custom` |
+| 셰이더 자유도 | **완전** | 내장 paint property | **완전** | **완전** |
+| Tile LOD 독립 1px | △ (텍스처 해상도 제한) | O (GPU u_ratio) | O (사용자 구현) | **O (per-pixel DEM 샘플링)** |
+| RTT 참여 | O | O | O (수정 시) | **X** (translucent 덧그리기) |
+| Terrain drape | O (자동) | O (자동) | O (수정 시) | **O (수동, get_elevation 호출)** |
+| Globe 대응 | O (자동) | O (자동) | 사용자 구현 | **O (projection data 활용)** |
+| 코어 수정 | 불필요 | 불필요 | **필요** | 불필요 |
+| API 안정성 | 상 (Texture/Context) | 중 (LineBucket @internal) | 해당 없음 | 중 (terrain API @internal) |
+| queryRenderedFeatures | X | O | X | X |
+| Style 표현식 자동 평가 | X (사용자 구현) | **O** | X | X |
+| 메모리 | tile 수 × tileSize² | bucket geometry | 사용자 재량 | **거의 없음 (공유)** |
+| 복잡도 | 중 | **높음** | 낮음 (코어 수정 후) | 중 |
+
+### Architecture 4가 "더 적절한" 경우 vs 그렇지 않은 경우
+
+**더 적절한 경우** (✓ Architecture 4 권장):
+- CustomLayer로 이미 렌더하고 있던 도메인 로직을 terrain drape까지 확장하고 싶을 때
+- 셰이더 자유도가 핵심 요구사항이면서 terrain 대응도 필요할 때
+- RTT 참여 없이도 괜찮을 때 (심볼이 위에 얹히지 않아도 OK 등)
+- 데이터를 mesh 정점이 아니라 uniform/텍스처로 공급하고 싶을 때 (예: 도메인 데이터 텍스처를 샘플링하는 셰이더)
+
+**덜 적절한 경우** (✗ 다른 Arch 권장):
+- 내장 paint property(`line-width`, `line-gradient` 등)로 표현 가능한 표준 벡터 렌더 → **Arch 2**
+- `queryRenderedFeatures` 등 style 파이프라인 기능이 필요 → **Arch 2**
+- 심볼/sky와의 정확한 z-order가 필요 → **Arch 1 또는 Arch 2** (RTT 참여)
+- terrain 비활성 시에도 동일 경로로 동작해야 하고 평면 폴백을 별도 유지하기 싫을 때 → **Arch 1/2** (자동)
+
+### 최종 권장 (사용자의 원 요구 "CustomLayer 수준의 자유 + RTT drape" 관점)
+
+사용자 요구를 다시 정리하면: "CustomLayer 수준의 셰이더 자유도를 유지한 채 terrain drape가 되는 렌더링"이었다. 이에 대한 답:
+
+- **Arch 4가 가장 직접적이고 자연스러운 답**. 자유도 유지 + mesh 공유 + projection 자동 대응.
+- **단 한 가지 트레이드오프**: RTT 스택 외부에서 그리기 때문에 z-order가 translucent pass 뒤로 고정. 이게 UX에 문제 안 되면 Arch 4 채택이 최선.
+- z-order가 결정적으로 중요하면 Arch 1 (셰이더 자유도는 포기) 또는 Arch 3 (코어 수정 수용) 고려.
+
+---
+
 ## 후속 작업 가능성 (스코프 외)
 
 - Architecture 1 승격: `src/source/custom_raster_source_base.ts` 추상 베이스 클래스 (FBO/texture 라이프사이클 + prepare 배치 렌더 + strategy D 자동 관리, 사용자는 `rasterize(gl, tile, zoom)` 만 override)
