@@ -186,72 +186,198 @@ const layer = {
 **단점**:
 - terrain 활성 시 terrain이 이미 보유한 mesh와 중복 생성 (메모리 ~100KB per unique key × granularity 수; 실무상 무시 가능)
 
-### 패턴 2 — terrain mesh 직접 재활용 (메모리 최적화 원할 때)
+### 패턴 2 — terrain mesh 직접 재활용 (구조와 주의사항)
 
-Terrain 활성 시 `terrain.getTerrainMesh()` mesh 인스턴스를 그대로 **참조만** 해서 draw. mesh 중복 생성 제거. 단 `@internal` API 의존 + Pos3dArray(stride=8) vertex 포맷 처리 필요.
+`terrain.getTerrainMesh()`가 반환하는 mesh는 **terrain 전용으로 특수 구성된 mesh**라서 단순한 정규 격자가 아니다. 재활용하려면 그 구조를 이해하고 셰이더에서 동일하게 처리해야 한다.
+
+#### 실제 mesh 구조 (`src/render/terrain.ts:433-496` 기준)
+
+Vertex 포맷: `Pos3dArray` = `{a_pos3d: Int16 × 3}` (정의: `src/data/pos3d_attributes.ts`)
+
+3개 섹션이 하나의 VBO에 순차 배치:
+
+1. **Main grid** (129×129 = 16,641 vertex)
+   - 좌표: `(x * delta, y * delta, 0)` — z=0
+   - delta = EXTENT / 128 = 64
+   - 주 렌더 표면
+
+2. **Top/bottom frame** — 타일 경계 stitching용 2×129 = 258 vertex
+   - `northY = northPole ? NORTH_POLE_Y(-32768) : 0`, `northZ = northPole ? 0 : 1`
+   - `southY = southPole ? SOUTH_POLE_Y(+32767) : EXTENT`, `southZ = southPole ? 0 : 1`
+   - **z=1이면 frame vertex** (pole이 아닐 때)
+
+3. **Left/right frame** — 수직 "벽" 516 vertex
+   - `for (x of [0, 1]) for (y of [0..128]) for (z of [0, 1]) → (x*EXTENT, y*delta, z)`
+   - 같은 (x, y) 좌표에 z=0(메인)과 z=1(frame) 쌍으로 ribbon 생성
+
+전체 vertex 수: 16,641 + 258 + 516 ≈ **17,415**. **SegmentVector는 하나**(`SegmentVector.simpleSegment(0, 0, vertexArray.length, indexArray.length)`)로 메인+프레임을 한 번의 draw call로 처리.
+
+#### z (frame-bit)의 역할 — 필수 이해 포인트
+
+Terrain vertex shader (`src/shaders/glsl/terrain.vertex.glsl`) 핵심:
+
+```glsl
+in vec3 a_pos3d;
+uniform float u_ele_delta;
+
+void main() {
+  float ele = get_elevation(a_pos3d.xy);
+  float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+  gl_Position = projectTileFor3D(a_pos3d.xy, ele - ele_delta);
+  // ...
+}
+```
+
+- `a_pos3d.z == 1.0`인 frame vertex는 elevation을 `u_ele_delta` 만큼 **아래로 내림**
+- `u_ele_delta = terrain.getMeshFrameDelta(zoom) = 2πR / 2^zoom / 5` (`terrain.ts:505-508`)
+- 이 수직 offset이 **서로 다른 zoom 레벨의 인접 타일 간 elevation seam을 가림** (zoom mismatch stitching)
+- Pole frame은 z=0으로 예외 처리 (이미 pole 좌표 자체가 투영됨)
+
+**따라서 terrain mesh를 custom layer에서 재활용하면서 elevation을 사용한다면, frame-bit 처리를 셰이더에서 동일하게 수행해야 한다**. 그렇지 않으면 zoom 전환 시 cross-tile seam이 발생.
+
+#### 두 가지 사용 시나리오
+
+##### 시나리오 2A — 2D projection only (elevation 사용 안 함)
+
+단순 tile 격자로만 활용. z=1 frame vertex는 (x, y) 위치가 메인 grid와 동일하므로 `projectTile`이 같은 픽셀로 투영 → 화면상 degenerate 효과, 시각적 아티팩트 없음.
+
+```glsl
+// Vertex shader
+in vec3 a_pos3d;   // 3 컴포넌트로 받되 xy만 사용
+out vec2 v_pos;
+void main() {
+  gl_Position = projectTile(a_pos3d.xy);
+  v_pos = a_pos3d.xy / 8192.0;
+}
+```
 
 ```js
-onAdd(map, gl) { this.map = map; },
+// Binding
+gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+gl.enableVertexAttribArray(aPos3d);
+gl.vertexAttribPointer(aPos3d, 3, gl.SHORT, false, 0, 0); // Int16 × 3, stride packed
+gl.drawElements(
+  gl.TRIANGLES,
+  mesh.segments.get()[0].primitiveLength * 3,   // primitiveLength = 삼각형 수
+  gl.UNSIGNED_SHORT, 0
+);
+```
 
+> Pos3dArray stride는 `createLayout`의 4-byte 정렬에 따라 6 또는 8 바이트. 안전을 위해 `stride=0`으로 두면 GPU가 attribute size(3 × 2 = 6)로 자동 추론.
+
+##### 시나리오 2B — elevation 적용 drape (terrain 표면과 정렬)
+
+Terrain 표면과 완전히 동일한 elevation + seam 처리가 필요한 경우. 터레인 셰이더 패턴을 그대로 따라야 함.
+
+```glsl
+in vec3 a_pos3d;
+uniform float u_ele_delta;       // = terrain.getMeshFrameDelta(zoom)
+uniform sampler2D u_terrain;     // DEM 텍스처 (terrain.getTerrainData)
+uniform mat4 u_terrain_matrix;
+uniform vec4 u_terrain_unpack;
+uniform float u_terrain_dim;
+uniform float u_terrain_exaggeration;
+
+// _prelude.vertex.glsl:146-166에서 복제한 get_elevation
+float get_elevation(vec2 pos) { /* ... */ }
+
+void main() {
+  float ele = get_elevation(a_pos3d.xy);
+  float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+  gl_Position = projectTileFor3D(a_pos3d.xy, ele - ele_delta);
+}
+```
+
+```js
+// render() 내부
+const td = terrain.getTerrainData(tileID);
+const eleDelta = terrain.getMeshFrameDelta(this.map.getZoom());
+gl.uniform1f(locations.u_ele_delta, eleDelta);
+gl.activeTexture(gl.TEXTURE0 + 2);
+gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+gl.uniform1i(locations.u_terrain, 2);
+gl.uniformMatrix4fv(locations.u_terrain_matrix, false, td.u_terrain_matrix);
+gl.uniform1f(locations.u_terrain_dim, td.u_terrain_dim);
+gl.uniform4fv(locations.u_terrain_unpack, td.u_terrain_unpack);
+gl.uniform1f(locations.u_terrain_exaggeration, td.u_terrain_exaggeration);
+// ... projection uniforms + 바인딩/드로우
+```
+
+**결과**: 커스텀 layer가 terrain 표면과 **완전히 같은 geometry**로 렌더됨. cross-tile seam 처리까지 terrain과 일치.
+
+#### 패턴 2 전체 render 스켈레톤 (시나리오 2B 기준)
+
+```js
 render(gl, args) {
-  const {program, aPos, locations} = this.getShader(gl, args.shaderData);
-  const isGlobe = args.shaderData.variantName === 'globe';
+  const {program, aPos3d, locations} = this.getShader(gl, args.shaderData);
   const terrain = this.map.terrain;
+  if (!terrain) { this._renderFlat(gl, args); return; }   // 폴백
+
+  const isGlobe = args.shaderData.variantName === 'globe';
+  const eleDelta = terrain.getMeshFrameDelta(this.map.getZoom());
 
   gl.useProgram(program);
-  // ... blend 등 setup
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniform1f(locations.u_ele_delta, eleDelta);
 
-  const tiles = terrain
-    ? terrain.tileManager.getRenderableTiles().map(t => t.tileID)
-    : this.map.coveringTiles({tileSize: 512});
+  for (const tile of terrain.tileManager.getRenderableTiles()) {
+    const tileID = tile.tileID;
+    if (isGlobe && tileID.wrap !== 0) continue;
 
-  for (const tileID of tiles) {
-    if (isGlobe && !terrain && tileID.wrap !== 0) continue;
-
+    const mesh = terrain.getTerrainMesh(tileID);
+    const td = terrain.getTerrainData(tileID);
     const proj = this.map.transform.getProjectionData({
       overscaledTileID: tileID,
-      applyTerrainMatrix: false,
+      applyTerrainMatrix: false,     // 우리가 직접 get_elevation 사용
       applyGlobeMatrix: true,
     });
-    // uniforms 바인딩 (패턴 1과 동일)
 
-    if (terrain) {
-      // @internal API 사용: terrain mesh는 Pos3dArray (x, y, frame-bit) 3컴포넌트, stride=8
-      // VertexBuffer/IndexBuffer 래퍼 접근도 @internal
-      const mesh = terrain.getTerrainMesh(tileID);
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
-      gl.enableVertexAttribArray(aPos);
-      // stride=8이지만 a_pos는 처음 2컴포넌트(x,y)만 읽음. 3번째 frame-bit는 무시
-      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 8, 0);
-      gl.drawElements(
-        gl.TRIANGLES,
-        mesh.segments.get()[0].primitiveLength * 3,
-        gl.UNSIGNED_SHORT,
-        0
-      );
-    } else {
-      // 폴백: createTileMesh 경로 (패턴 1의 getMesh 사용)
-      const mesh = this.getMesh(gl, tileID.canonical.x, tileID.canonical.y, tileID.canonical.z);
-      gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vbo);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.ibo);
-      gl.enableVertexAttribArray(aPos);
-      gl.vertexAttribPointer(aPos, 2, gl.SHORT, false, 0, 0);
-      gl.drawElements(gl.TRIANGLES, mesh.indexCount, gl.UNSIGNED_SHORT, 0);
-    }
+    // Projection uniforms
+    gl.uniformMatrix4fv(locations.u_projection_matrix, false, proj.mainMatrix);
+    gl.uniformMatrix4fv(locations.u_projection_fallback_matrix, false, proj.fallbackMatrix);
+    gl.uniform4f(locations.u_projection_clipping_plane, ...proj.clippingPlane);
+    gl.uniform1f(locations.u_projection_transition, proj.projectionTransition);
+    gl.uniform4f(locations.u_projection_tile_mercator_coords, ...proj.tileMercatorCoords);
+
+    // Terrain DEM uniforms
+    gl.activeTexture(gl.TEXTURE0 + 2);
+    gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+    gl.uniform1i(locations.u_terrain, 2);
+    gl.uniformMatrix4fv(locations.u_terrain_matrix, false, td.u_terrain_matrix);
+    gl.uniform1f(locations.u_terrain_dim, td.u_terrain_dim);
+    gl.uniform4fv(locations.u_terrain_unpack, td.u_terrain_unpack);
+    gl.uniform1f(locations.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+    // Mesh 바인딩 — @internal API
+    gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+    gl.enableVertexAttribArray(aPos3d);
+    gl.vertexAttribPointer(aPos3d, 3, gl.SHORT, false, 0, 0);   // Int16 × 3, packed
+    gl.drawElements(
+      gl.TRIANGLES,
+      mesh.segments.get()[0].primitiveLength * 3,
+      gl.UNSIGNED_SHORT, 0
+    );
   }
 }
 ```
 
-**장점**:
-- terrain이 이미 만들어둔 mesh를 참조만, 메모리 중복 없음
-- terrain의 pole/frame vertex가 그대로 활용됨 (stitching 유리)
-- terrain의 `tileManager.getRenderableTiles()`로 타일 목록도 공유
+#### 패턴 2 정리
 
-**단점**:
-- `@internal` API 의존: `mesh.vertexBuffer.buffer`, `mesh.indexBuffer.buffer`, `mesh.segments.get()` 모두 내부 타입
-- 두 개의 vertex 포맷/stride 경로를 layer 코드가 관리해야 함
-- MapLibre 마이너 업그레이드 시 검증 필요
+**언제 쓰나**:
+- Custom layer 결과를 terrain 표면과 **픽셀 단위로 정확히 정렬** 필요 (공동 렌더링, overlay mask 등)
+- 메모리 중복 없음 (terrain이 이미 만든 mesh 재사용)
+- Cross-tile seam 처리까지 terrain과 일치시켜야 할 때
+
+**비용**:
+- `@internal` API 4개 의존: `getTerrainMesh`, `getTerrainData`, `getMeshFrameDelta`, `mesh.vertexBuffer.buffer`/`indexBuffer.buffer`/`segments.get()`
+- 셰이더가 terrain 패턴(`a_pos3d.z == 1.0 ? u_ele_delta : 0.0`)을 정확히 복제해야 함
+- MapLibre 마이너 업그레이드 시 이 5가지 지점 모두 검증
+
+**terrain OFF 폴백**: Pattern 1의 `createTileMesh` 경로로 전환. `_renderFlat` 내부에 별도 구현.
 
 ### 선택 권장
 

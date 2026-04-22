@@ -73,7 +73,18 @@ Projection interface의 공개 getter. `map.style.projection.subdivisionGranular
 - **Globe** (`vertical_perspective_projection.ts:28`): `tile: SubdivisionGranularityExpression(base=128, min=32)` → z=0에서 128, z≥3에서 32 clamp → vertex 33×33=1,089. 구면 곡률에 충분하지만 terrain elevation 고해상도에는 부족.
 
 **terrain.meshSize**
-Terrain 내부 mesh 해상도 상수. 고정값 `128` (`src/render/terrain.ts:146`). `terrain.getTerrainMesh()`가 129×129=16,641 vertex 그리드 생성. Terrain elevation 샘플링에 적합한 밀도. Arch 4에서 terrain 활성 시 이 mesh를 재사용하는 것이 권장 패턴.
+Terrain 내부 mesh 해상도 상수. 고정값 `128` (`src/render/terrain.ts:146`). `terrain.getTerrainMesh()`는 단순 정규 격자가 아니라 **3 섹션 합성 mesh**를 반환:
+1. Main grid — 129×129 = 16,641 vertex, z=0 (메인 표면)
+2. Top/bottom frame — 258 vertex, z=1 (stitching) 또는 pole 좌표 (z=0)
+3. Left/right frame walls — 516 vertex, z=0과 z=1 ribbon 쌍
+
+전체 약 17,415 vertex, 단일 `SegmentVector`로 배치. Vertex 포맷은 `Pos3dArray`(`Int16 × 3` = x, y, frame-bit). 정의: `src/render/terrain.ts:433-496`.
+
+**frame-bit (a_pos3d.z)**
+Terrain mesh vertex의 3번째 컴포넌트. 값 `0`이면 메인 vertex, `1`이면 frame vertex. Terrain 셰이더(`src/shaders/glsl/terrain.vertex.glsl`)가 `float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0; gl_Position = projectTileFor3D(a_pos3d.xy, ele - ele_delta);` 로 frame vertex를 `u_ele_delta` 만큼 아래로 내려 cross-zoom 타일 경계 seam을 은닉. Arch 4 패턴 2에서 elevation drape 사용 시 이 로직을 셰이더에 동일 복제해야 함.
+
+**getMeshFrameDelta(zoom)**
+`2 * PI * earthRadius / 2^zoom / 5`. Frame vertex를 아래로 내리는 높이(미터 단위). 정의: `src/render/terrain.ts:505-508`. 줌이 높아질수록 작아짐(타일이 작아져서 필요한 offset도 감소).
 
 **vertexShaderPrelude**
 CustomLayer의 `render(gl, args)`에서 `args.shaderData.vertexShaderPrelude`로 접근. 현재 projection에 맞는 `projectTile`/`projectTileFor3D`/`projectLineThickness` 등 함수를 셰이더에 자동 제공. mercator/globe 분기 불필요. 생성 지점: `src/webgl/draw/draw_custom.ts:26`.

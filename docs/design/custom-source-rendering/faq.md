@@ -255,6 +255,8 @@ MapLibre가 WebGPU 백엔드를 도입하면 `Texture`/`Context` 추상화가 �
 
 **왜 `createTileMesh`만으로는 terrain에 불충분한가**: `subdivisionGranularity.tile`은 **projection 곡률**(globe의 구면) 재현용이지 **elevation 샘플링**용이 아니다. Mercator는 `noSubdivision`이라 vertex 4개만 생성 → 타일 내부 elevation이 선형 평탄화됨. Globe도 z≥3에서 32로 고정되어 DEM 해상도를 못 따라감.
 
+**`getTerrainMesh` 재활용의 숨은 비용**: terrain mesh는 단순 정규 격자가 아니라 **main grid + top/bottom frame + left/right frame** 3 섹션이 하나의 VBO에 합쳐진 특수 구조. vertex 포맷은 `Pos3dArray`(Int16 × 3)이고 3번째 컴포넌트는 **frame-bit** (z=1이면 frame vertex). 터레인 셰이더는 `a_pos3d.z == 1.0 ? u_ele_delta : 0.0`로 frame vertex를 `terrain.getMeshFrameDelta(zoom)` 만큼 아래로 내려 cross-zoom 타일 경계 seam을 숨긴다. Custom layer에서 이 mesh를 재활용하며 elevation까지 쓴다면, 셰이더에 동일한 frame-bit 처리를 **반드시 복제**해야 한다. 단순히 `in vec2 a_pos`로 xy만 읽으면 zoom 전환 시 seam이 보인다 (다만 elevation을 안 쓰면 괜찮음 — frame vertex가 메인 vertex와 같은 (x,y)라서 화면에서 degenerate).
+
 **관련**: [Arch 4 Mesh 선택 가이드](architectures/arch-4-customlayer-terrain-mesh.md#mesh-선택-가이드--중요--vertex-밀도-차이)
 
 ---
