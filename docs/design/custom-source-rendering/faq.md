@@ -37,7 +37,7 @@ Custom Source Rendering 설계에 관한 꼬리 질문과 답변. 카테고리�
 | 1 | `Texture`, `Context` — 안정 | 마이너 업그레이드 대체로 안전 |
 | 2 | `LineBucket` populate — `@internal` | 중간 위험, 업그레이드마다 검증 필요 |
 | 3 | 자체 fork | upstream 변경 흡수 비용 존재 |
-| 4 | `getTerrainData`/`getTerrainMesh` — `@internal` | 중간 위험, 얕은 커플링 |
+| 4 | `createTileMesh` + `subdivisionGranularity` + `vertexShaderPrelude` — **공개 안정** | 낮은 위험. terrain elevation 확장 시에만 `getTerrainData` `@internal` 의존 |
 
 ## 데이터 흐름 (Q5-8)
 
@@ -197,7 +197,9 @@ globe에서 흔한 상황 (구의 far-side까지 타일 요청 가능).
 
 **Arch 4 (가장 유사)**:
 - `render` 로직 거의 그대로 유지
-- `terrain.getTerrainMesh` 기반 per-tile 루프로 감싸기
+- **`maplibregl.createTileMesh()` 기반 per-tile 루프로 감싸기** (공식 패턴, 공개 API)
+- 기존 `terrain.getTerrainMesh` 사용하던 코드는 `createTileMesh`로 교체 권장 — 공개 API 사용으로 업그레이드 안정성 향상
+- 셰이더의 `projectTile`/`projectTileFor3D`는 `args.shaderData.vertexShaderPrelude`로 자동 제공
 
 **Arch 1**:
 - `render` 로직을 `prepare`로 이전
@@ -229,6 +231,22 @@ MapLibre가 WebGPU 백엔드를 도입하면 `Texture`/`Context` 추상화가 �
 - **Arch 4**: `getTerrainMesh` 반환 타입 변경 가능, 셰이더 WGSL 재작성
 
 2026년 기준 WebGPU는 MapLibre roadmap에서 실험 단계.
+
+### Q27. Arch 4에서 `createTileMesh`와 `terrain.getTerrainMesh` 차이?
+
+| 항목 | `maplibregl.createTileMesh` | `terrain.getTerrainMesh` |
+|---|---|---|
+| 공개 여부 | **공개 (`src/index.ts:382` export)** | `@internal` |
+| 안정성 | 안정 — 공식 예제 reference | MapLibre 내부용, 마이너 업그레이드 변경 가능 |
+| Granularity | `options.granularity`로 호출자 제어 | 고정 `meshSize = 128` |
+| Pole 처리 | `extendToNorthPole`/`extendToSouthPole` 플래그 | globe에서 자동 판정 |
+| Border 생성 | `generateBorders` 플래그 (seam 방지 2-pass 렌더 가능) | 자체 관리 |
+| Output | `{vertices, indices, uses32bitIndices}` typed array | VBO/IBO 포함 `Mesh` 객체 |
+| 사용 시점 | CustomLayer 전반 (globe 포함) | terrain 내부 전용 |
+
+**권장**: Arch 4에서는 **`createTileMesh` 사용**. `subdivisionGranularity`로 줌별 분할 조정, pole 플래그로 globe 대응. terrain elevation 샘플링은 별도 `terrain.getTerrainData` 사용(여전히 `@internal`).
+
+**관련**: [Arch 4 공식 패턴](architectures/arch-4-customlayer-terrain-mesh.md) · [Arch 4 마이그레이션 주의사항](architectures/arch-4-customlayer-terrain-mesh.md#마이그레이션-주의사항-기존-terrain-mesh-재활용-패턴에서)
 
 ---
 

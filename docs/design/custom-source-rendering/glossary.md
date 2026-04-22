@@ -58,6 +58,23 @@ MapLibre의 globe 모드 구현체. 세계 좌표를 구면 각도로 변환 후
 **transitionState**
 globe ↔ mercator 전환 애니메이션의 현재 상태. `0`이면 순수 mercator, `1`이면 순수 vertical perspective, 0~1 사이는 행렬 보간. 정의: `GlobeProjection`.
 
+## 공식 Custom Layer 헬퍼
+
+**createTileMesh**
+타일 mesh 생성 공개 helper. 시그니처: `createTileMesh(options: CreateTileMeshOptions, forceIndicesSize?: '16bit'|'32bit') → {vertices, indices, uses32bitIndices}`. Int16 vertex 배열(`a_pos` SHORT × 2) + Uint16/Uint32 index 배열 반환. 정의: `src/util/create_tile_mesh.ts:116`, export: `src/index.ts:382`. 공식 예제: `test/examples/add-a-custom-layer-with-tiles-to-a-globe.html`.
+
+**CreateTileMeshOptions**
+`{granularity?: number, generateBorders?: boolean, extendToNorthPole?: boolean, extendToSouthPole?: boolean}`. `generateBorders: true`는 타일 경계 seam 방지용 border mesh 추가. pole 플래그는 globe 모드에서 구의 극점 커버용. 정의: `src/util/create_tile_mesh.ts`.
+
+**subdivisionGranularity**
+Projection interface의 공개 getter. `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)` 호출로 줌 레벨별 적정 mesh 분할 횟수 획득. mercator는 저 granularity, globe는 고 granularity 반환. 정의: `src/geo/projection/projection.ts:91`.
+
+**vertexShaderPrelude**
+CustomLayer의 `render(gl, args)`에서 `args.shaderData.vertexShaderPrelude`로 접근. 현재 projection에 맞는 `projectTile`/`projectTileFor3D`/`projectLineThickness` 등 함수를 셰이더에 자동 제공. mercator/globe 분기 불필요. 생성 지점: `src/webgl/draw/draw_custom.ts:26`.
+
+**projectTileFor3D**
+셰이더 prelude 함수. `(vec2 posInTile, float elevation) → vec4 clipSpace`. mercator에서는 `projectTileWithElevation`과 동일, globe에서는 구면 투영 + elevation 오프셋 적용. Terrain drape 렌더링의 표준 함수.
+
 ## 빌드·타입
 
 **@internal**

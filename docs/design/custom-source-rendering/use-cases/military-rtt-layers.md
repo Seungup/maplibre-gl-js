@@ -142,7 +142,7 @@ prepare(): void {
 
 ## TerrainBridge / SourceBridge 격리 레이어
 
-MapLibre 독립성 극대화를 위한 공유 추상 레이어. Arch 4의 [TerrainBridge](../architectures/arch-4-customlayer-terrain-mesh.md#terrainbridge-격리-패턴) 패턴과 동일 철학을 Arch 1에도 적용:
+MapLibre 독립성 극대화를 위한 공유 추상 레이어. Arch 4는 `maplibregl.createTileMesh` (공개 API) 기반이므로 커플링이 얕고, 브리지 범위는 주로 Arch 1의 `Texture`/`Context` 추상화에 집중하면 된다. Arch 4에서 terrain elevation 확장이 필요한 경우에만 `getTerrainData`(@internal) 브리지가 필요.
 
 ```ts
 interface SourceBridge {
@@ -181,11 +181,12 @@ CI에서 브리지 단위 테스트 유지 → MapLibre 업그레이드 시 회�
 
 ## 다중 커스텀 소스 조율
 
-여러 도메인 레이어(fog + coverage + threat)를 동시 활성화할 때:
+여러 도메인 레이어(fog + coverage + threat + 3D 유닛)를 동시 활성화할 때:
 
-- **공유 FBO 전략**: 각 소스가 독립 FBO 유지, tile.texture만 라이프사이클 관리
-- **공유 프로그램 캐시**: 동일 셰이더 variant 공유하여 compile 비용 절감
-- **레이어 순서로 합성 순서 제어**: style 순서로 blend 순서 명시
+- **공유 FBO 전략** (Arch 1): 각 소스가 독립 FBO 유지, `tile.texture`만 라이프사이클 관리
+- **공유 프로그램 캐시** (모든 Arch): 동일 셰이더 variant 공유하여 compile 비용 절감
+- **공유 mesh 캐시** (Arch 4): `maplibregl.createTileMesh` 결과를 여러 레이어가 공유 — `(granularity, pole flags, borders)` 키 기반 캐시를 모듈 스코프에 배치
+- **레이어 순서로 합성 순서 제어**: style 순서로 blend 순서 명시. RTT 참여 (Arch 1) 레이어는 스택 합성, Arch 4 레이어는 translucent pass에서 뒤에 덧그려짐
 - **데이터 원천 공유**: 센서 데이터 텍스처 하나를 여러 소스가 참조
 
 ## 검증 체크리스트

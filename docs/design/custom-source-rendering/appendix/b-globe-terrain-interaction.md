@@ -113,12 +113,16 @@ if (renderOptions.isRenderingGlobe && !this.style.map.terrain) {
 3. `drawTerrain`: 동일
 4. 결과: globe + terrain 위에 픽셀 완벽한 1px 라인
 
-### Arch 4의 Globe + Terrain 흐름
+### Arch 4의 Globe + Terrain 흐름 (공식 `createTileMesh` 패턴)
 
-1. `CustomLayer.render()`에서 `map.terrain.getTerrainMesh(tileID)` 획득
-2. `map.transform.getProjectionData({applyGlobeMatrix: true})`로 globe-aware projection
-3. 사용자 셰이더가 `get_elevation()` 호출 + globe projection 적용
-4. 결과: 구면 + elevation mesh에 사용자 도메인 렌더
+1. `CustomLayer.render(gl, args)`에서 `map.coveringTiles()` 또는 자체 enumeration으로 가시 타일 목록 획득
+2. 타일마다 `maplibregl.createTileMesh({granularity, extendToNorthPole, extendToSouthPole}, '16bit')` 호출 (공개 API, 캐싱 권장)
+   - granularity는 `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)`로 결정
+   - pole 타일은 `extendToNorthPole`/`extendToSouthPole: true`
+3. `map.transform.getProjectionData({overscaledTileID, applyGlobeMatrix: true})`로 projection uniform 세트 획득 (`mainMatrix`, `fallbackMatrix`, `clippingPlane`, `projectionTransition`, `tileMercatorCoords`)
+4. 셰이더는 `args.shaderData.vertexShaderPrelude`가 자동 제공하는 `projectTile(a_pos)` 또는 `projectTileFor3D(a_pos, ele)` 호출 — mercator/globe 분기 불필요
+5. Terrain drape 필요 시 `map.terrain.getTerrainData(tileID)`(@internal)로 DEM 텍스처/행렬 획득, 셰이더에서 `get_elevation(a_pos)` 호출 (함수는 `_prelude.vertex.glsl`에서 수동 복제)
+6. 결과: 구면/평면 + (선택적) elevation 위에 사용자 도메인 렌더
 
 ### Globe 전환 애니메이션 (transitionState 중간값)
 

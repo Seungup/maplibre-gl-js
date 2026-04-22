@@ -16,15 +16,15 @@ MapLibre GL JS에서 CustomLayer가 RTT(Render-to-Texture)에 참여하지 못�
 
 | | [Arch 1](architectures/arch-1-custom-raster-source.md) | [Arch 2](architectures/arch-2-custom-vector-bucket-source.md) | [Arch 3](architectures/arch-3-customlayer-rtt-fork.md) | [Arch 4](architectures/arch-4-customlayer-terrain-mesh.md) |
 |---|---|---|---|---|
-| **접근** | Custom Raster Source + `tile.texture` | Custom Vector Bucket Source + `tile.buckets` | CustomLayer RTT 확장 (코어 fork) | CustomLayer + terrain mesh 재활용 |
+| **접근** | Custom Raster Source + `tile.texture` | Custom Vector Bucket Source + `tile.buckets` | CustomLayer RTT 확장 (코어 fork) | CustomLayer + 공식 `createTileMesh` |
 | **레이어 타입** | `raster` | `line` / `fill` / `circle` | `custom` + `renderToTexture` | `custom` |
 | **셰이더 자유도** | 완전 (prepare 내부) | 내장 paint property 한정 | 완전 | 완전 |
 | **1px 정밀도** | 텍스처 해상도 제한 | GPU `u_ratio`로 자동 | 사용자 구현 | per-pixel DEM 샘플링 |
 | **RTT 참여** | 예 | 예 | 예 (fork 후) | 아니오 |
 | **Terrain drape** | 자동 | 자동 | 자동 (fork 후) | 수동 (`get_elevation` 호출) |
-| **Globe 자동 대응** | 예 | 예 | 사용자 구현 | 예 (`getProjectionData`) |
+| **Globe 자동 대응** | 예 | 예 | 사용자 구현 | 예 (`vertexShaderPrelude`) |
 | **코어 수정** | 불필요 | 불필요 | 필요 (~80 LoC) | 불필요 |
-| **API 안정성** | 상 | 중 (`LineBucket` @internal) | 해당 없음 | 중 (terrain API @internal) |
+| **API 안정성** | 상 | 중 (`LineBucket` @internal) | 해당 없음 | 상 (`createTileMesh` 공개) — terrain 확장 시만 @internal |
 | **Feature query 네이티브** | 미지원 | 지원 | 미지원 | 미지원 |
 
 ## 선택 가이드
@@ -80,6 +80,7 @@ MapLibre GL JS에서 CustomLayer가 RTT(Render-to-Texture)에 참여하지 못�
 - **Globe + Terrain은 공존 가능** — RTT pass에서 mercator로 per-tile FBO 생성, `drawTerrain`이 `applyGlobeMatrix: true`로 terrain mesh를 globe 투영 (`src/webgl/draw/draw_terrain.ts:93`).
 - **CustomLayer는 RTT 스택에 참여 불가** — translucent 패스의 전역 render 호출 1회, tile-local 컨셉 없음.
 - **커스텀 소스의 `prepare()`는 벡터 소스의 RTT per-tile 렌더와 기능적으로 동등** — 텍스처 저장소를 통해 간접 경로로 RTT 합성에 합류.
+- **CustomLayer에서 tile-based 렌더링은 공식 API로 지원됨** — `maplibregl.createTileMesh()` (`src/index.ts:382` export) + `map.style.projection.subdivisionGranularity.tile.getGranularityForZoomLevel(z)` + `args.shaderData.vertexShaderPrelude`. 공식 예제: `test/examples/add-a-custom-layer-with-tiles-to-a-globe.html`.
 
 ## 로드맵
 
