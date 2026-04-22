@@ -483,6 +483,78 @@ for (const tileID of tiles) {
 
 `wrap !== 0` 기반 필터는 절대 사용하지 말 것.
 
+## Skirt Z-Fighting 대응
+
+패턴 2 시나리오 2B처럼 terrain mesh를 재활용하여 elevation까지 정렬시키면, **base terrain이 이미 그린 같은 mesh 위에 custom layer가 다시 그리는** 구조가 된다. 메인 grid는 문제없으나 **skirt(좌우·상하 frame 벽)에서 z-fighting이 발생**한다.
+
+### 원인
+
+- `drawTerrain`과 Arch 4 `render`가 같은 depth mode(`LEQUAL`, `ReadWrite`)로 동일 mesh 렌더 (`painter.getDepthModeFor3D()`)
+- Skirt 벽은 **뷰 방향과 거의 평행한 수직면**이라 미세한 depth drift가 화면에 flicker로 즉시 드러남
+- `a_pos3d.z == 1.0 ? u_ele_delta : 0.0` 계산이 이론상 동일하지만 uniform 정밀도·GPU 연산 순서로 인한 bit-level drift 발생
+- 메인 grid는 완만한 경사라 drift가 덮여 보이지 않음
+
+### 대응 방법
+
+#### (1) Polygon Offset — 권장 기본
+
+GL 표준 coplanar z-fighting 해결. 한 줄로 해결 가능.
+
+```js
+gl.enable(gl.POLYGON_OFFSET_FILL);
+gl.polygonOffset(-1, -1);   // factor=-1, units=-1: 카메라 쪽으로 최소 단계 바이어스
+for (const tile of terrain.tileManager.getRenderableTiles()) {
+  // ... draw ...
+}
+gl.disable(gl.POLYGON_OFFSET_FILL);
+```
+
+필요시 `(-2, -2)` 등으로 조정. 대부분 GPU에서 `(-1, -1)`이 최소 분해 가능 depth 단계.
+
+#### (2) Skirt 생략 draw
+
+기본 지도 terrain이 skirt를 이미 그리므로 custom layer가 중복으로 그릴 필요 없음. 메인 grid 삼각형만 그려 z-fighting 원천 제거.
+
+Mesh 구조 (`src/render/terrain.ts:443-494`)상 **메인 grid는 앞쪽 `meshSize² × 2 = 32,768` 삼각형**을 차지하고 skirt가 뒤에 append되므로, index offset 0부터 메인 grid 분량만 draw:
+
+```js
+const MAIN_TRIANGLE_COUNT = 128 * 128 * 2;   // meshSize=128 기준
+gl.drawElements(
+  gl.TRIANGLES,
+  MAIN_TRIANGLE_COUNT * 3,   // = 98,304
+  gl.UNSIGNED_SHORT,
+  0
+);
+```
+
+- 장점: z-fighting 원천 제거, draw call 비용도 감소
+- 단점: 타일 LOD 경계에서 skirt가 안 보이면 base terrain이 비치는 seam이 드러날 수 있음. Custom layer가 반투명이면 통상 문제없음. 불투명 overlay에서는 Polygon offset 쪽이 안전.
+
+#### (3) Shader Depth Bias
+
+vertex shader 말미에 clip-space Z 바이어스:
+
+```glsl
+void main() {
+  float ele = get_elevation(a_pos3d.xy);
+  float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+  gl_Position = projectTileFor3D(a_pos3d.xy, ele - ele_delta);
+  gl_Position.z -= 0.0001 * gl_Position.w;   // 카메라 쪽 바이어스
+}
+```
+
+Polygon offset과 동등하지만 셰이더 내부에서 제어하므로 GL 상태 오염 없음.
+
+#### 선택 가이드
+
+| 상황 | 권장 |
+|---|---|
+| 반투명 overlay | **Skirt 생략** — 가장 깔끔, 성능↑ |
+| 불투명 overlay 또는 타일 LOD seam 민감 | **Polygon Offset** |
+| GL 상태 격리 필요 (예: 다른 custom layer와 상태 공유 우려) | **Shader Bias** |
+
+**권장 폐기**: `gl.disable(gl.DEPTH_TEST)` — 지형 뒷면 폐색을 무시해 반구 뒷부분이 앞으로 나오는 등 globe에서 특히 부적합.
+
 ## Terrain Elevation 확장
 
 공식 예제는 terrain elevation을 다루지 않는다. 지형 drape 효과를 위해 `map.terrain.getTerrainData(tileID)`를 함께 호출하여 DEM 텍스처를 샘플링한다. 단 이 API는 `@internal`.

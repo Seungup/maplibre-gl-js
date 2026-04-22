@@ -279,6 +279,17 @@ Globe 셰이더(`_projection_globe.vertex.glsl:47-54`)는 `spherical.x = mercato
 
 **관련**: [Arch 4 — Globe Antimeridian Wrap 처리](architectures/arch-4-customlayer-terrain-mesh.md#globe-antimeridian-wrap-처리)
 
+### Q29. Arch 4 패턴 2에서 terrain skirt에 z-fighting이 생기는 이유 / 해결?
+
+Base terrain과 Arch 4 CustomLayer가 **같은 terrain mesh를 두 번 렌더**(같은 `LEQUAL`/`ReadWrite` depth mode)하기 때문. 메인 grid는 완만한 경사라 floating-point drift가 덮여 보이지 않지만, skirt 벽은 뷰 방향과 거의 평행한 수직면이라 미세 drift가 flicker로 즉시 드러난다.
+
+**해결책** (상황별 선택):
+- **반투명 overlay → Skirt 생략 draw**: `gl.drawElements(gl.TRIANGLES, 128*128*2*3, gl.UNSIGNED_SHORT, 0)` — 메인 grid만 그림. 기본 terrain이 skirt를 그리므로 coverage 유지.
+- **불투명 overlay → Polygon Offset**: `gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(-1, -1);` — 표준 GL 기법.
+- **GL 상태 격리 필요 → Shader Bias**: vertex shader 말미에 `gl_Position.z -= 0.0001 * gl_Position.w;`
+
+상세: [Arch 4 — Skirt Z-Fighting 대응](architectures/arch-4-customlayer-terrain-mesh.md#skirt-z-fighting-대응)
+
 ---
 
 **See also**: [README](README.md) · [Glossary](glossary.md)
