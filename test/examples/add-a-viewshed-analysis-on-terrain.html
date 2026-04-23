@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Viewshed analysis on terrain</title>
+    <meta property="og:description" content="GPU viewshed analysis using a custom layer that reuses the terrain mesh and ray-marches against MapLibre's terrain depth framebuffer (G-buffer) in screen space." />
+    <meta property="og:created" content="2026-04-23" />
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="../../dist/maplibre-gl.css" />
+    <script src="../../dist/maplibre-gl-dev.js"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        html, body, #map { height: 100%; }
+        #panel {
+            position: absolute; top: 12px; left: 12px;
+            background: rgba(255, 255, 255, 0.92);
+            padding: 12px 14px; border-radius: 6px;
+            font: 12px/1.4 sans-serif; color: #222;
+            min-width: 220px; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+        }
+        #panel h4 { margin: 0 0 8px 0; font-size: 13px; }
+        #panel label { display: block; margin: 6px 0 2px; }
+        #panel input[type=range] { width: 100%; }
+        #panel button { margin-top: 8px; }
+        #panel .hint { color: #555; margin-top: 8px; font-size: 11px; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+    <h4>Viewshed Analysis</h4>
+    <label>Observer height: <span id="heightLabel">2</span> m</label>
+    <input type="range" id="height" min="0" max="200" value="2" step="1">
+    <label>Ray-march steps: <span id="stepsLabel">64</span></label>
+    <input type="range" id="steps" min="16" max="256" value="64" step="8">
+    <label>Bias: <span id="biasLabel">0.0001</span></label>
+    <input type="range" id="bias" min="1" max="100" value="10" step="1">
+    <button id="reset">Reset observer</button>
+    <div class="hint">Click on the map to set the observer position.<br>Green = visible, Red = blocked.</div>
+</div>
+<script>
+// =============================================================================
+// Viewshed Analysis Example
+//
+// Technique:
+//   1. Custom layer based on Arch 4 Pattern 2: reuse terrain.getTerrainMesh()
+//      so the layer renders on the exact terrain surface.
+//   2. MapLibre's drawDepth pre-rendering populates terrainData.depthTexture
+//      every frame. We treat this depth FBO as a screen-space G-buffer.
+//   3. Fragment shader ray-marches in screen space from observer position to
+//      the current fragment, sampling terrain depth at each step. If terrain
+//      is closer to the camera than the ray, the fragment is occluded.
+//   4. gl_FragDepth is set from u_depth at fragment UV — Depth Replacement —
+//      to bit-match base terrain depth and eliminate skirt z-fighting.
+//
+// Limitations (intentional, for example simplicity):
+//   - Screen-space: areas not visible on screen cannot occlude or be analyzed.
+//   - Designed for mercator + terrain. Globe mode works but observer XYZ
+//     projection may have minor inaccuracies due to spherical transform.
+// =============================================================================
+
+const map = new maplibregl.Map({
+    container: 'map',
+    zoom: 12.5,
+    center: [11.39085, 47.27574],   // Innsbruck, Alps — strong relief
+    pitch: 70,
+    bearing: -20,
+    maxPitch: 85,
+    style: {
+        version: 8,
+        sources: {
+            osm: {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                attribution: '&copy; OpenStreetMap Contributors',
+                maxzoom: 19
+            },
+            terrainSource: {
+                type: 'raster-dem',
+                url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
+                tileSize: 256
+            }
+        },
+        layers: [{id: 'osm', type: 'raster', source: 'osm'}],
+        terrain: {source: 'terrainSource', exaggeration: 1.0}
+    }
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch: true}));
+
+// -----------------------------------------------------------------------------
+// Observer state
+// -----------------------------------------------------------------------------
+const observer = {lngLat: null, height: 2, marker: null};
+const settings = {steps: 64, bias: 0.0001};
+
+map.on('click', (e) => {
+    observer.lngLat = e.lngLat;
+    if (observer.marker) observer.marker.remove();
+    observer.marker = new maplibregl.Marker({color: '#d92626'})
+        .setLngLat(e.lngLat).addTo(map);
+    map.triggerRepaint();
+});
+
+document.getElementById('height').oninput = (e) => {
+    observer.height = +e.target.value;
+    document.getElementById('heightLabel').textContent = e.target.value;
+    map.triggerRepaint();
+};
+document.getElementById('steps').oninput = (e) => {
+    settings.steps = +e.target.value;
+    document.getElementById('stepsLabel').textContent = e.target.value;
+    map.triggerRepaint();
+};
+document.getElementById('bias').oninput = (e) => {
+    settings.bias = +e.target.value * 1e-5;   // 1..100 → 1e-5..1e-3
+    document.getElementById('biasLabel').textContent = settings.bias.toFixed(5);
+    map.triggerRepaint();
+};
+document.getElementById('reset').onclick = () => {
+    observer.lngLat = null;
+    if (observer.marker) { observer.marker.remove(); observer.marker = null; }
+    map.triggerRepaint();
+};
+
+// -----------------------------------------------------------------------------
+// Custom Viewshed Layer (Arch 4 Pattern 2)
+// -----------------------------------------------------------------------------
+const viewshedLayer = {
+    id: 'viewshed',
+    type: 'custom',
+    renderingMode: '3d',
+
+    onAdd(mapInstance, gl) {
+        this.map = mapInstance;
+
+        const vs = `#version 300 es
+            precision highp float;
+            in vec3 a_pos3d;
+            uniform mat4 u_projection_matrix;
+            uniform mat4 u_terrain_matrix;
+            uniform sampler2D u_terrain;
+            uniform float u_terrain_dim;
+            uniform vec4 u_terrain_unpack;
+            uniform float u_terrain_exaggeration;
+            uniform float u_ele_delta;
+
+            // Replicated from src/shaders/glsl/_prelude.vertex.glsl
+            float get_elevation(vec2 pos) {
+                vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+                vec2 dim = vec2(u_terrain_dim + 2.0);
+                vec2 c = (floor(coord) + 0.5) / dim;
+                vec2 f = fract(coord);
+                float d = 1.0 / dim.x;
+                vec4 tl = texture(u_terrain, c);
+                vec4 tr = texture(u_terrain, c + vec2(d, 0.0));
+                vec4 bl = texture(u_terrain, c + vec2(0.0, d));
+                vec4 br = texture(u_terrain, c + vec2(d, d));
+                float etl = (tl.r * 256.0 * 256.0 * 256.0 + tl.g * 256.0 * 256.0 + tl.b * 256.0 - u_terrain_unpack.a) * u_terrain_unpack.r;
+                float etr = (tr.r * 256.0 * 256.0 * 256.0 + tr.g * 256.0 * 256.0 + tr.b * 256.0 - u_terrain_unpack.a) * u_terrain_unpack.r;
+                float ebl = (bl.r * 256.0 * 256.0 * 256.0 + bl.g * 256.0 * 256.0 + bl.b * 256.0 - u_terrain_unpack.a) * u_terrain_unpack.r;
+                float ebr = (br.r * 256.0 * 256.0 * 256.0 + br.g * 256.0 * 256.0 + br.b * 256.0 - u_terrain_unpack.a) * u_terrain_unpack.r;
+                return mix(mix(etl, etr, f.x), mix(ebl, ebr, f.x), f.y) * u_terrain_exaggeration;
+            }
+
+            void main() {
+                float ele = get_elevation(a_pos3d.xy);
+                float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+                gl_Position = u_projection_matrix * vec4(a_pos3d.xy, ele - ele_delta, 1.0);
+            }`;
+
+        const fs = `#version 300 es
+            precision highp float;
+            uniform highp sampler2D u_depth;
+            uniform vec2 u_viewport;
+            uniform vec3 u_observer_screen;
+            uniform float u_observer_valid;
+            uniform float u_bias;
+            uniform float u_min_distance;
+            uniform int u_steps;
+            out vec4 fragColor;
+
+            // Replicated from src/shaders/glsl/_prelude.vertex.glsl:104-106
+            float unpack(vec4 color) {
+                const vec4 bitShifts = vec4(
+                    1.0 / (256.0 * 256.0 * 256.0),
+                    1.0 / (256.0 * 256.0),
+                    1.0 / 256.0,
+                    1.0
+                );
+                return dot(color, bitShifts);
+            }
+
+            void main() {
+                vec2 fragUV = gl_FragCoord.xy / u_viewport;
+                float fragZ = gl_FragCoord.z;
+
+                // Force fragment depth to bit-match base terrain depth
+                // — Depth Replacement, eliminates skirt z-fighting.
+                gl_FragDepth = unpack(texture(u_depth, fragUV));
+
+                if (u_observer_valid < 0.5) discard;
+
+                vec2 obsUV = u_observer_screen.xy;
+                float obsZ = u_observer_screen.z;
+
+                // Trivially visible region around observer
+                if (length(fragUV - obsUV) < u_min_distance) {
+                    fragColor = vec4(1.0, 0.95, 0.2, 0.55);
+                    return;
+                }
+
+                // Screen-space ray-march from observer to fragment
+                bool blocked = false;
+                int steps = u_steps;
+                for (int i = 1; i < 256; i++) {
+                    if (i >= steps - 1) break;
+                    float t = float(i) / float(steps);
+                    vec2 sampleUV = mix(obsUV, fragUV, t);
+                    float rayZ = mix(obsZ, fragZ, t);
+                    float terrainZ = unpack(texture(u_depth, sampleUV));
+                    if (terrainZ < rayZ - u_bias) { blocked = true; break; }
+                }
+
+                fragColor = blocked
+                    ? vec4(0.85, 0.15, 0.15, 0.45)
+                    : vec4(0.20, 0.85, 0.30, 0.45);
+            }`;
+
+        const compile = (type, src) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(s));
+            }
+            return s;
+        };
+        this.program = gl.createProgram();
+        gl.attachShader(this.program, compile(gl.VERTEX_SHADER, vs));
+        gl.attachShader(this.program, compile(gl.FRAGMENT_SHADER, fs));
+        gl.linkProgram(this.program);
+
+        this.aPos3d = gl.getAttribLocation(this.program, 'a_pos3d');
+        this.u = {};
+        for (const name of [
+            'u_projection_matrix', 'u_terrain_matrix', 'u_terrain', 'u_terrain_dim',
+            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
+            'u_depth', 'u_viewport', 'u_observer_screen', 'u_observer_valid',
+            'u_bias', 'u_min_distance', 'u_steps'
+        ]) {
+            this.u[name] = gl.getUniformLocation(this.program, name);
+        }
+    },
+
+    // Project observer (lng/lat + total elevation) to screen NDC.
+    // Returns {u, v, z, valid} or null. Uses public modelViewProjectionMatrix.
+    _projectObserver(totalEle) {
+        const merc = maplibregl.MercatorCoordinate.fromLngLat(observer.lngLat, totalEle);
+        const ws = this.map.transform.worldSize;
+        const wp = [merc.x * ws, merc.y * ws, merc.z * ws, 1];
+        const m = this.map.transform.modelViewProjectionMatrix;
+        const cx = m[0]*wp[0] + m[4]*wp[1] + m[8]*wp[2]  + m[12]*wp[3];
+        const cy = m[1]*wp[0] + m[5]*wp[1] + m[9]*wp[2]  + m[13]*wp[3];
+        const cz = m[2]*wp[0] + m[6]*wp[1] + m[10]*wp[2] + m[14]*wp[3];
+        const cw = m[3]*wp[0] + m[7]*wp[1] + m[11]*wp[2] + m[15]*wp[3];
+        if (cw <= 0) return null;
+        const nx = cx / cw, ny = cy / cw, nz = cz / cw;
+        return {
+            u: nx * 0.5 + 0.5,
+            v: ny * 0.5 + 0.5,
+            z: nz * 0.5 + 0.5,
+            valid: nx >= -1.2 && nx <= 1.2 && ny >= -1.2 && ny <= 1.2
+        };
+    },
+
+    render(gl) {
+        const terrain = this.map.terrain;
+        if (!terrain) return;
+
+        // Resolve observer screen position (or mark invalid)
+        let obsScreen = [0, 0, 0];
+        let obsValid = 0.0;
+        if (observer.lngLat) {
+            const groundEle = terrain.getElevationForLngLat(observer.lngLat) || 0;
+            const proj = this._projectObserver(groundEle + observer.height);
+            if (proj && proj.valid) {
+                obsScreen = [proj.u, proj.v, proj.z];
+                obsValid = 1.0;
+            }
+        }
+
+        gl.useProgram(this.program);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // Common uniforms (per-frame)
+        const dpr = window.devicePixelRatio || 1;
+        gl.uniform2f(this.u.u_viewport, gl.canvas.width / dpr, gl.canvas.height / dpr);
+        gl.uniform3f(this.u.u_observer_screen, obsScreen[0], obsScreen[1], obsScreen[2]);
+        gl.uniform1f(this.u.u_observer_valid, obsValid);
+        gl.uniform1f(this.u.u_bias, settings.bias);
+        gl.uniform1f(this.u.u_min_distance, 0.005);
+        gl.uniform1i(this.u.u_steps, settings.steps);
+
+        const eleDelta = terrain.getMeshFrameDelta(this.map.transform.zoom);
+        gl.uniform1f(this.u.u_ele_delta, eleDelta);
+
+        // Per-tile draw loop. Note: we do NOT filter wrap !== 0 in globe mode —
+        // antimeridian tiles are intentionally returned with wrap=±1 by
+        // GlobeCoveringTilesDetailsProvider.getWrap (see arch-4 docs).
+        for (const tile of terrain.tileManager.getRenderableTiles()) {
+            const tileID = tile.tileID;
+            const td = terrain.getTerrainData(tileID);
+            const proj = this.map.transform.getProjectionData({
+                overscaledTileID: tileID,
+                applyTerrainMatrix: false,
+                applyGlobeMatrix: true
+            });
+
+            gl.uniformMatrix4fv(this.u.u_projection_matrix, false, proj.mainMatrix);
+
+            // Terrain DEM bindings (slot 2)
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+            gl.uniform1i(this.u.u_terrain, 2);
+            gl.uniformMatrix4fv(this.u.u_terrain_matrix, false, td.u_terrain_matrix);
+            gl.uniform1f(this.u.u_terrain_dim, td.u_terrain_dim);
+            gl.uniform4fv(this.u.u_terrain_unpack, td.u_terrain_unpack);
+            gl.uniform1f(this.u.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+            // Terrain depth FBO as G-buffer (slot 3)
+            gl.activeTexture(gl.TEXTURE3);
+            gl.bindTexture(gl.TEXTURE_2D, td.depthTexture);
+            gl.uniform1i(this.u.u_depth, 3);
+
+            // Reuse terrain mesh (Pos3dArray, packed Int16x3)
+            const mesh = terrain.getTerrainMesh(tileID);
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+            gl.enableVertexAttribArray(this.aPos3d);
+            gl.vertexAttribPointer(this.aPos3d, 3, gl.SHORT, false, 0, 0);
+            gl.drawElements(
+                gl.TRIANGLES,
+                mesh.segments.get()[0].primitiveLength * 3,
+                gl.UNSIGNED_SHORT, 0
+            );
+        }
+    }
+};
+
+map.on('style.load', () => {
+    map.addLayer(viewshedLayer);
+});
+</script>
+</body>
+</html>
