@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <title>Viewshed analysis on terrain</title>
-    <meta property="og:description" content="GPU viewshed analysis using a custom layer that reuses the terrain mesh and ray-marches against MapLibre's terrain depth framebuffer (G-buffer) in screen space." />
+    <meta property="og:description" content="Two-pass G-buffer viewshed analysis: top-down orthographic elevation render around the observer (Pass 1), then main terrain render that ray-marches the G-buffer in mercator space using projectTileFor3D (Pass 2)." />
     <meta property="og:created" content="2026-04-23" />
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -16,7 +16,7 @@
             background: rgba(255, 255, 255, 0.92);
             padding: 12px 14px; border-radius: 6px;
             font: 12px/1.4 sans-serif; color: #222;
-            min-width: 220px; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+            min-width: 240px; box-shadow: 0 1px 4px rgba(0,0,0,.2);
         }
         #panel h4 { margin: 0 0 8px 0; font-size: 13px; }
         #panel label { display: block; margin: 6px 0 2px; }
@@ -28,54 +28,69 @@
 <body>
 <div id="map"></div>
 <div id="panel">
-    <h4>Viewshed Analysis</h4>
+    <h4>Viewshed Analysis (G-buffer + Ray-March)</h4>
     <label>Observer height: <span id="heightLabel">2</span> m</label>
-    <input type="range" id="height" min="0" max="200" value="2" step="1">
-    <label>Ray-march steps: <span id="stepsLabel">64</span></label>
-    <input type="range" id="steps" min="16" max="256" value="64" step="8">
-    <label>Bias: <span id="biasLabel">0.0001</span></label>
-    <input type="range" id="bias" min="1" max="100" value="10" step="1">
+    <input type="range" id="height" min="0" max="500" value="2" step="1">
+    <label>AOI radius: <span id="aoiLabel">5</span> km</label>
+    <input type="range" id="aoi" min="1" max="30" value="5" step="1">
+    <label>Ray-march steps: <span id="stepsLabel">96</span></label>
+    <input type="range" id="steps" min="16" max="256" value="96" step="8">
+    <label>Bias (m): <span id="biasLabel">2.0</span></label>
+    <input type="range" id="bias" min="0" max="100" value="20" step="1">
     <button id="reset">Reset observer</button>
-    <div class="hint">Click on the map to set the observer position.<br>Green = visible, Red = blocked.</div>
+    <div class="hint">Click on the map to set observer.<br>
+        Green = visible, Red = blocked.<br>
+        AOI = analysis area (mercator square around observer).</div>
 </div>
 <script>
 // =============================================================================
-// Viewshed Analysis Example — G-buffer + Screen-Space Ray-March
+// Two-Pass G-Buffer Viewshed
 //
-// Pipeline per frame:
-//   [Pass 1 — pre-existing in MapLibre]
-//     drawDepth() at src/webgl/draw/draw_terrain.ts:16-36
-//     ↳ renders terrain mesh depth into screen-size FBO (RGBA-packed float)
-//     ↳ exposed to our layer via terrainData.depthTexture — this is our G-buffer.
+// Pass 1 (prerender, offscreen):
+//   Render terrain mesh into a square top-down orthographic FBO centered on
+//   the observer in mercator space. Fragment writes packed elevation as RGBA.
+//   Vertex math: gl_Position = u_ortho_merc * vec4(merc.xy, ele - eleDelta, 1)
+//   This is the "G-buffer": per-mercator-coordinate elevation, independent of
+//   the camera view.
 //
-//   [Pass 2 — pre-existing in MapLibre]
-//     drawTerrain() with RTT layers composited — the base map.
+// Pass 2 (render, translucent):
+//   Render terrain mesh on screen using MapLibre's official prelude
+//   (args.shaderData.vertexShaderPrelude → projectTileFor3D). For each
+//   fragment, ray-march in mercator XY from observer to fragment, sampling
+//   the G-buffer to compare terrain elevation vs interpolated ray elevation.
+//   gl_FragDepth ← MapLibre's terrain depth FBO (Depth Replacement) to
+//   eliminate skirt z-fighting.
 //
-//   [Pass 3 — this custom layer]
-//     For each renderable terrain tile:
-//       - Reuse terrain.getTerrainMesh() (Arch 4 Pattern 2)
-//       - Vertex: same projection as base terrain (matches position exactly)
-//       - Fragment: ray-march the G-buffer (u_depth) from observer to fragment
-//         in screen space; classify as visible/blocked. Output translucent
-//         color and replace gl_FragDepth with unpack(u_depth) to bit-match
-//         base terrain depth → no skirt z-fighting.
-//
-// Why this is "G-buffer based":
-//   MapLibre already does a pre-pass (drawDepth) that serializes terrain depth
-//   into a screen-space texture. That texture IS a G-buffer (one channel:
-//   depth). Our viewshed never touches geometry again — all visibility
-//   queries are screen-space lookups against that buffer.
-//
-// Limitations (intentional, for example simplicity):
-//   - Screen-space only: occluders outside the viewport cannot block rays.
-//   - Primarily demonstrates mercator + terrain. Globe works; the observer's
-//     NDC projection via modelViewProjectionMatrix is correct for both.
+// Public APIs only (per arch-4 docs):
+//   - map.queryTerrainElevation(lngLat)
+//   - map.terrain.tileManager.getRenderableTiles()
+//   - map.terrain.getTerrainMesh(tileID), getTerrainData(tileID),
+//     getMeshFrameDelta(zoom)               (these are @internal but stable)
+//   - map.transform.getProjectionData(...)
+//   - args.shaderData.vertexShaderPrelude   (provides projectTileFor3D)
+//   - MercatorCoordinate.fromLngLat / .meterInMercatorCoordinateUnits()
 // =============================================================================
+
+const GBUF_SIZE = 1024;       // G-buffer resolution
+const ELE_MIN   = -500;       // packing range (meters)
+const ELE_MAX   = 9000;
+
+function orthoMatrix(l, r, b, t, n, f) {
+    const m = new Float32Array(16);
+    m[0]  = 2 / (r - l);
+    m[5]  = 2 / (t - b);
+    m[10] = -2 / (f - n);
+    m[12] = -(r + l) / (r - l);
+    m[13] = -(t + b) / (t - b);
+    m[14] = -(f + n) / (f - n);
+    m[15] = 1;
+    return m;
+}
 
 const map = new maplibregl.Map({
     container: 'map',
     zoom: 12.5,
-    center: [11.39085, 47.27574],   // Innsbruck, Alps — strong relief
+    center: [11.39085, 47.27574],   // Innsbruck, Alps
     pitch: 70,
     bearing: -20,
     maxPitch: 85,
@@ -102,10 +117,10 @@ const map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl({visualizePitch: true}));
 
 // -----------------------------------------------------------------------------
-// Observer state
+// Observer state + UI
 // -----------------------------------------------------------------------------
 const observer = {lngLat: null, height: 2, marker: null};
-const settings = {steps: 64, bias: 0.0001};
+const settings = {aoiRadiusM: 5000, steps: 96, biasM: 2.0};
 
 map.on('click', (e) => {
     observer.lngLat = e.lngLat;
@@ -114,10 +129,14 @@ map.on('click', (e) => {
         .setLngLat(e.lngLat).addTo(map);
     map.triggerRepaint();
 });
-
 document.getElementById('height').oninput = (e) => {
     observer.height = +e.target.value;
     document.getElementById('heightLabel').textContent = e.target.value;
+    map.triggerRepaint();
+};
+document.getElementById('aoi').oninput = (e) => {
+    settings.aoiRadiusM = +e.target.value * 1000;
+    document.getElementById('aoiLabel').textContent = e.target.value;
     map.triggerRepaint();
 };
 document.getElementById('steps').oninput = (e) => {
@@ -126,8 +145,8 @@ document.getElementById('steps').oninput = (e) => {
     map.triggerRepaint();
 };
 document.getElementById('bias').oninput = (e) => {
-    settings.bias = +e.target.value * 1e-5;   // 1..100 → 1e-5..1e-3
-    document.getElementById('biasLabel').textContent = settings.bias.toFixed(5);
+    settings.biasM = +e.target.value / 10;
+    document.getElementById('biasLabel').textContent = settings.biasM.toFixed(1);
     map.triggerRepaint();
 };
 document.getElementById('reset').onclick = () => {
@@ -137,7 +156,7 @@ document.getElementById('reset').onclick = () => {
 };
 
 // -----------------------------------------------------------------------------
-// Custom Viewshed Layer (Arch 4 Pattern 2)
+// Custom Viewshed Layer (G-buffer + main render)
 // -----------------------------------------------------------------------------
 const viewshedLayer = {
     id: 'viewshed',
@@ -146,17 +165,66 @@ const viewshedLayer = {
 
     onAdd(mapInstance, gl) {
         this.map = mapInstance;
+        this._setupGBuffer(gl);
+        this._setupPass1Program(gl);
+        // Pass 2 program is built lazily in render() because it needs
+        // shaderData.vertexShaderPrelude from the first render call.
+        this.pass2Cache = new Map();
+    },
 
+    onRemove(mapInstance, gl) {
+        if (this.gbufFBO) gl.deleteFramebuffer(this.gbufFBO);
+        if (this.gbufTex) gl.deleteTexture(this.gbufTex);
+        if (this.gbufDepth) gl.deleteRenderbuffer(this.gbufDepth);
+        if (this.pass1Program) gl.deleteProgram(this.pass1Program);
+        if (this.pass2Cache) {
+            for (const v of this.pass2Cache.values()) gl.deleteProgram(v.program);
+        }
+    },
+
+    _setupGBuffer(gl) {
+        // RGBA8 packed-float G-buffer storing elevation in mercator-ortho space.
+        this.gbufTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.gbufTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, GBUF_SIZE, GBUF_SIZE, 0,
+                      gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        this.gbufDepth = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, this.gbufDepth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16,
+                               GBUF_SIZE, GBUF_SIZE);
+
+        this.gbufFBO = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.gbufFBO);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                                gl.TEXTURE_2D, this.gbufTex, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,
+                                   gl.RENDERBUFFER, this.gbufDepth);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+    },
+
+    _setupPass1Program(gl) {
+        // Vertex: top-down ortho around observer in mercator space.
+        // Reads DEM elevation per vertex, emits mercator (xy) + elevation
+        // packed into clip space; fragment writes elevation as packed RGBA.
         const vs = `#version 300 es
             precision highp float;
             in vec3 a_pos3d;
-            uniform mat4 u_projection_matrix;
-            uniform mat4 u_terrain_matrix;
+            uniform mat4 u_ortho_merc;
+            uniform vec4 u_projection_tile_mercator_coords;
             uniform sampler2D u_terrain;
+            uniform mat4 u_terrain_matrix;
             uniform float u_terrain_dim;
             uniform vec4 u_terrain_unpack;
             uniform float u_terrain_exaggeration;
             uniform float u_ele_delta;
+            out float v_ele;
 
             // Replicated from src/shaders/glsl/_prelude.vertex.glsl:136-166
             float ele(vec2 pos) {
@@ -172,208 +240,394 @@ const viewshedLayer = {
                 float tr = ele(c + vec2(d, 0.0));
                 float bl = ele(c + vec2(0.0, d));
                 float br = ele(c + vec2(d, d));
-                float elevation = mix(mix(tl, tr, f.x), mix(bl, br, f.x), f.y);
-                return elevation * u_terrain_exaggeration;
+                return mix(mix(tl, tr, f.x), mix(bl, br, f.x), f.y) * u_terrain_exaggeration;
             }
 
             void main() {
-                float ele = get_elevation(a_pos3d.xy);
+                float e = get_elevation(a_pos3d.xy);
                 float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
-                gl_Position = u_projection_matrix * vec4(a_pos3d.xy, ele - ele_delta, 1.0);
+                vec2 mercFrac = a_pos3d.xy / 8192.0;
+                vec2 merc = u_projection_tile_mercator_coords.xy
+                          + u_projection_tile_mercator_coords.zw * mercFrac;
+                gl_Position = u_ortho_merc * vec4(merc, e - ele_delta, 1.0);
+                v_ele = e;
             }`;
 
         const fs = `#version 300 es
             precision highp float;
-
-            // G-buffer: MapLibre's pre-rendered terrain depth FBO.
-            // Populated each frame by drawDepth() at
-            // src/webgl/draw/draw_terrain.ts:16-36, exposed as
-            // terrainData.depthTexture at src/render/terrain.ts:310.
-            // RGBA-packed 24-bit float depth (unpacked via bitShifts below).
-            uniform highp sampler2D u_depth;
-
-            uniform vec2 u_viewport;
-            uniform vec3 u_observer_screen;    // NDC-space: (u, v, z) in [0,1]
-            uniform float u_observer_valid;
-            uniform float u_bias;
-            uniform float u_min_distance;
-            uniform int u_steps;
+            in float v_ele;
+            uniform float u_ele_min;
+            uniform float u_ele_max;
             out vec4 fragColor;
 
-            // Replicated from src/shaders/glsl/_prelude.vertex.glsl:104-106
-            float unpack(vec4 color) {
-                const vec4 bitShifts = vec4(
-                    1.0 / (256.0 * 256.0 * 256.0),
-                    1.0 / (256.0 * 256.0),
-                    1.0 / 256.0,
-                    1.0
-                );
-                return dot(color, bitShifts);
+            // Pack a normalized [0, 1] float into RGBA8 (24-bit precision).
+            vec4 packFloat(float v) {
+                v = clamp(v, 0.0, 1.0);
+                vec4 enc = vec4(1.0, 255.0, 65025.0, 16581375.0) * v;
+                enc = fract(enc);
+                enc -= enc.yzww * vec4(1.0/255.0, 1.0/255.0, 1.0/255.0, 0.0);
+                return enc;
+            }
+
+            void main() {
+                float n = (v_ele - u_ele_min) / (u_ele_max - u_ele_min);
+                fragColor = packFloat(n);
+            }`;
+
+        const compile = (type, src, label) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(`Pass1 ${label} shader:\n` + gl.getShaderInfoLog(s));
+            }
+            return s;
+        };
+        this.pass1Program = gl.createProgram();
+        gl.attachShader(this.pass1Program, compile(gl.VERTEX_SHADER, vs, 'vertex'));
+        gl.attachShader(this.pass1Program, compile(gl.FRAGMENT_SHADER, fs, 'fragment'));
+        gl.linkProgram(this.pass1Program);
+        if (!gl.getProgramParameter(this.pass1Program, gl.LINK_STATUS)) {
+            console.error('Pass1 link: ' + gl.getProgramInfoLog(this.pass1Program));
+        }
+
+        this.p1A = {aPos3d: gl.getAttribLocation(this.pass1Program, 'a_pos3d')};
+        this.p1U = {};
+        for (const n of [
+            'u_ortho_merc', 'u_projection_tile_mercator_coords',
+            'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
+            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
+            'u_ele_min', 'u_ele_max'
+        ]) this.p1U[n] = gl.getUniformLocation(this.pass1Program, n);
+    },
+    _getPass2Program(gl, shaderData) {
+        // Per-projection-variant cache (mercator vs globe shaders differ).
+        const key = shaderData.variantName;
+        if (this.pass2Cache.has(key)) return this.pass2Cache.get(key);
+
+        // Vertex: uses MapLibre's official prelude (provides projectTileFor3D
+        // for current projection), then calls it with elevation.
+        // Outputs mercator (xy) + raw elevation for fragment ray-march.
+        const vs = `#version 300 es
+            precision highp float;
+            ${shaderData.vertexShaderPrelude}
+            ${shaderData.define}
+
+            in vec3 a_pos3d;
+
+            uniform vec4 u_projection_tile_mercator_coords;
+            uniform sampler2D u_terrain;
+            uniform mat4 u_terrain_matrix;
+            uniform float u_terrain_dim;
+            uniform vec4 u_terrain_unpack;
+            uniform float u_terrain_exaggeration;
+            uniform float u_ele_delta;
+
+            out vec2 v_frag_merc;
+            out float v_frag_ele;
+
+            // Replicated from src/shaders/glsl/_prelude.vertex.glsl:136-166
+            float ele(vec2 pos) {
+                vec4 rgb = (texture(u_terrain, pos) * 255.0) * u_terrain_unpack;
+                return rgb.r + rgb.g + rgb.b - u_terrain_unpack.a;
+            }
+            float get_elevation(vec2 pos) {
+                vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+                vec2 f = fract(coord);
+                vec2 c = (floor(coord) + 0.5) / (u_terrain_dim + 2.0);
+                float d = 1.0 / (u_terrain_dim + 2.0);
+                float tl = ele(c);
+                float tr = ele(c + vec2(d, 0.0));
+                float bl = ele(c + vec2(0.0, d));
+                float br = ele(c + vec2(d, d));
+                return mix(mix(tl, tr, f.x), mix(bl, br, f.x), f.y) * u_terrain_exaggeration;
+            }
+
+            void main() {
+                float e = get_elevation(a_pos3d.xy);
+                float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+                // Use the official prelude function — handles mercator + globe.
+                gl_Position = projectTileFor3D(a_pos3d.xy, e - ele_delta);
+
+                vec2 mercFrac = a_pos3d.xy / 8192.0;
+                v_frag_merc = u_projection_tile_mercator_coords.xy
+                            + u_projection_tile_mercator_coords.zw * mercFrac;
+                v_frag_ele = e;
+            }`;
+
+        const fs = `#version 300 es
+            precision highp float;
+            in vec2 v_frag_merc;
+            in float v_frag_ele;
+
+            uniform sampler2D u_gbuf;            // packed elevation G-buffer
+            uniform vec2 u_gbuf_origin;          // mercator (left, top)
+            uniform vec2 u_gbuf_size;            // mercator (width, height)
+            uniform float u_ele_min;
+            uniform float u_ele_max;
+
+            uniform vec3 u_observer_merc;        // (merc.x, merc.y, elevation in m)
+            uniform float u_observer_valid;
+            uniform float u_aoi_radius;          // in mercator units
+            uniform float u_bias;                // in meters
+            uniform int u_steps;
+
+            // Depth Replacement (skirt z-fighting)
+            uniform highp sampler2D u_depth;
+            uniform vec2 u_viewport;
+
+            out vec4 fragColor;
+
+            float unpackPacked(vec4 rgba) {
+                return dot(rgba, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0));
+            }
+            float unpackDepth(vec4 rgba) {
+                return dot(rgba, vec4(1.0/16581375.0, 1.0/65025.0, 1.0/255.0, 1.0));
+            }
+            float gbufElevation(vec2 merc) {
+                vec2 uv = (merc - u_gbuf_origin) / u_gbuf_size;
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return -9999.0;
+                float n = unpackPacked(texture(u_gbuf, uv));
+                return mix(u_ele_min, u_ele_max, n);
             }
 
             void main() {
                 vec2 fragUV = gl_FragCoord.xy / u_viewport;
-                float fragZ = gl_FragCoord.z;
 
-                // Depth Replacement: read G-buffer at this fragment's UV and
-                // write it to gl_FragDepth so our depth bit-matches the base
-                // terrain — eliminates skirt z-fighting deterministically.
-                gl_FragDepth = unpack(texture(u_depth, fragUV));
+                // Depth Replacement: bit-match base terrain depth.
+                gl_FragDepth = unpackDepth(texture(u_depth, fragUV));
 
                 if (u_observer_valid < 0.5) discard;
 
-                vec2 obsUV = u_observer_screen.xy;
-                float obsZ = u_observer_screen.z;
+                vec2 obsM = u_observer_merc.xy;
+                float obsE = u_observer_merc.z;
+                vec2 fragM = v_frag_merc;
+                float fragE = v_frag_ele;
 
-                // Trivially visible region around observer (avoids self-
-                // occlusion artifacts at the starting point of the ray).
-                if (length(fragUV - obsUV) < u_min_distance) {
-                    fragColor = vec4(1.0, 0.95, 0.2, 0.55);
-                    return;
-                }
+                // AOI clipping
+                float distToObs = length(fragM - obsM);
+                if (distToObs > u_aoi_radius) discard;
 
-                // Screen-space ray-march against the G-buffer.
-                // At each step along observer→fragment we compare the ray's
-                // expected depth to terrain depth sampled from u_depth.
-                // If terrain is closer to the camera (smaller Z), the ray
-                // is blocked at that step.
+                // World-space ray-march in mercator XY, sampling the G-buffer.
                 bool blocked = false;
                 int steps = u_steps;
                 for (int i = 1; i < 256; i++) {
                     if (i >= steps - 1) break;
                     float t = float(i) / float(steps);
-                    vec2 sampleUV = mix(obsUV, fragUV, t);
-                    float rayZ = mix(obsZ, fragZ, t);
-                    float terrainZ = unpack(texture(u_depth, sampleUV));
-                    if (terrainZ < rayZ - u_bias) { blocked = true; break; }
+                    vec2 sM = mix(obsM, fragM, t);
+                    float rayE = mix(obsE, fragE, t);
+                    float terE = gbufElevation(sM);
+                    if (terE > rayE + u_bias) { blocked = true; break; }
                 }
 
                 fragColor = blocked
-                    ? vec4(0.85, 0.15, 0.15, 0.45)
+                    ? vec4(0.85, 0.15, 0.15, 0.50)
                     : vec4(0.20, 0.85, 0.30, 0.45);
             }`;
 
-        const compile = (type, src) => {
+        const compile = (type, src, label) => {
             const s = gl.createShader(type);
             gl.shaderSource(s, src);
             gl.compileShader(s);
             if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-                const label = type === gl.VERTEX_SHADER ? 'vertex' : 'fragment';
-                console.error(`Viewshed ${label} shader compile error:\n` +
-                    gl.getShaderInfoLog(s));
+                console.error(`Pass2[${key}] ${label} shader:\n` + gl.getShaderInfoLog(s));
             }
             return s;
         };
-        this.program = gl.createProgram();
-        gl.attachShader(this.program, compile(gl.VERTEX_SHADER, vs));
-        gl.attachShader(this.program, compile(gl.FRAGMENT_SHADER, fs));
-        gl.linkProgram(this.program);
-        if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
-            console.error('Viewshed program link error: ' +
-                gl.getProgramInfoLog(this.program));
+        const program = gl.createProgram();
+        gl.attachShader(program, compile(gl.VERTEX_SHADER, vs, 'vertex'));
+        gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs, 'fragment'));
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            console.error(`Pass2[${key}] link: ` + gl.getProgramInfoLog(program));
         }
 
-        this.aPos3d = gl.getAttribLocation(this.program, 'a_pos3d');
-        this.u = {};
-        for (const name of [
-            'u_projection_matrix', 'u_terrain_matrix', 'u_terrain', 'u_terrain_dim',
+        const aPos3d = gl.getAttribLocation(program, 'a_pos3d');
+        const u = {};
+        for (const n of [
+            'u_projection_matrix', 'u_projection_fallback_matrix',
+            'u_projection_clipping_plane', 'u_projection_transition',
+            'u_projection_tile_mercator_coords',
+            'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
             'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
-            'u_depth', 'u_viewport', 'u_observer_screen', 'u_observer_valid',
-            'u_bias', 'u_min_distance', 'u_steps'
-        ]) {
-            this.u[name] = gl.getUniformLocation(this.program, name);
-        }
-    },
+            'u_gbuf', 'u_gbuf_origin', 'u_gbuf_size',
+            'u_ele_min', 'u_ele_max',
+            'u_observer_merc', 'u_observer_valid', 'u_aoi_radius',
+            'u_bias', 'u_steps',
+            'u_depth', 'u_viewport'
+        ]) u[n] = gl.getUniformLocation(program, n);
 
-    // Project observer (lng/lat + total elevation) to screen NDC.
-    // Uses public APIs:
-    //   - map.project(lngLat) returns screen-pixel XY (top-left origin).
-    //     Ignores elevation's minor effect on XY; fine for visualization.
-    //   - map.transform.lngLatToCameraDepth(lngLat, ele) returns NDC z in
-    //     [-1, 1] for mercator and globe (public on transform_interface.ts).
-    _projectObserver(totalEle) {
-        const pxDpr = window.devicePixelRatio || 1;
-        const vpW = this.map.getCanvas().width / pxDpr;
-        const vpH = this.map.getCanvas().height / pxDpr;
-        const px = this.map.project(observer.lngLat);   // screen pixels
-        const u = px.x / vpW;
-        const v = 1.0 - px.y / vpH;                     // flip Y for GL
-        const ndcZ = this.map.transform.lngLatToCameraDepth(observer.lngLat, totalEle);
-        const z = ndcZ * 0.5 + 0.5;
+        const entry = {program, aPos3d, u};
+        this.pass2Cache.set(key, entry);
+        return entry;
+    },
+    // Compute observer's mercator position + AOI bounds. Returns null if
+    // observer is unset or terrain is off.
+    _computeObserverAoi() {
+        const terrain = this.map.terrain;
+        if (!observer.lngLat || !terrain) return null;
+
+        const groundEle = this.map.queryTerrainElevation(observer.lngLat) || 0;
+        const totalEle = groundEle + observer.height;
+        const merc = maplibregl.MercatorCoordinate.fromLngLat(observer.lngLat, 0);
+        const mpu = merc.meterInMercatorCoordinateUnits();   // m → mercator units
+        const half = settings.aoiRadiusM * mpu;
         return {
-            u, v, z,
-            valid: u >= -0.1 && u <= 1.1 && v >= -0.1 && v <= 1.1 && z > 0 && z < 1
+            mercX: merc.x,
+            mercY: merc.y,
+            totalEle,
+            half,
+            mpu,
+            ortho: orthoMatrix(
+                merc.x - half, merc.x + half,
+                merc.y + half, merc.y - half,    // Y flipped (mercator down)
+                ELE_MIN, ELE_MAX                  // ortho z range
+            )
         };
     },
 
-    render(gl) {
+    prerender(gl, args) {
+        // Pass 1 — generate G-buffer (top-down ortho elevation around observer).
+        const aoi = this._computeObserverAoi();
+        if (!aoi) return;
         const terrain = this.map.terrain;
-        if (!terrain) return;
 
-        // Resolve observer screen position (or mark invalid).
-        // map.queryTerrainElevation is the public API for ground elevation
-        // (includes terrain exaggeration). Returns null if terrain is off.
-        let obsScreen = [0, 0, 0];
-        let obsValid = 0.0;
-        if (observer.lngLat) {
-            const groundEle = this.map.queryTerrainElevation(observer.lngLat) || 0;
-            const proj = this._projectObserver(groundEle + observer.height);
-            if (proj && proj.valid) {
-                obsScreen = [proj.u, proj.v, proj.z];
-                obsValid = 1.0;
-            }
-        }
+        // Bind G-buffer FBO and prepare state.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.gbufFBO);
+        gl.viewport(0, 0, GBUF_SIZE, GBUF_SIZE);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clearDepth(1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.depthMask(true);
+        gl.disable(gl.BLEND);
+        gl.disable(gl.CULL_FACE);
 
-        gl.useProgram(this.program);
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-        // Common uniforms (per-frame)
-        const dpr = window.devicePixelRatio || 1;
-        gl.uniform2f(this.u.u_viewport, gl.canvas.width / dpr, gl.canvas.height / dpr);
-        gl.uniform3f(this.u.u_observer_screen, obsScreen[0], obsScreen[1], obsScreen[2]);
-        gl.uniform1f(this.u.u_observer_valid, obsValid);
-        gl.uniform1f(this.u.u_bias, settings.bias);
-        gl.uniform1f(this.u.u_min_distance, 0.005);
-        gl.uniform1i(this.u.u_steps, settings.steps);
+        gl.useProgram(this.pass1Program);
+        gl.uniformMatrix4fv(this.p1U.u_ortho_merc, false, aoi.ortho);
+        gl.uniform1f(this.p1U.u_ele_min, ELE_MIN);
+        gl.uniform1f(this.p1U.u_ele_max, ELE_MAX);
 
         const eleDelta = terrain.getMeshFrameDelta(this.map.transform.zoom);
-        gl.uniform1f(this.u.u_ele_delta, eleDelta);
+        gl.uniform1f(this.p1U.u_ele_delta, eleDelta);
 
-        // Per-tile draw loop. Note: we do NOT filter wrap !== 0 in globe mode —
-        // antimeridian tiles are intentionally returned with wrap=±1 by
-        // GlobeCoveringTilesDetailsProvider.getWrap (see arch-4 docs).
         for (const tile of terrain.tileManager.getRenderableTiles()) {
             const tileID = tile.tileID;
             const td = terrain.getTerrainData(tileID);
+
+            // Tile mercator base + size (wrap-aware).
+            const c = tileID.canonical;
+            const scale = 1 / (1 << c.z);
+            gl.uniform4f(
+                this.p1U.u_projection_tile_mercator_coords,
+                c.x * scale + tileID.wrap, c.y * scale,
+                scale, scale
+            );
+
+            // Skip tiles outside AOI (perf).
+            const tileLeft   = c.x * scale + tileID.wrap;
+            const tileTop    = c.y * scale;
+            if (tileLeft + scale < aoi.mercX - aoi.half ||
+                tileLeft > aoi.mercX + aoi.half ||
+                tileTop + scale < aoi.mercY - aoi.half ||
+                tileTop > aoi.mercY + aoi.half) continue;
+
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+            gl.uniform1i(this.p1U.u_terrain, 2);
+            gl.uniformMatrix4fv(this.p1U.u_terrain_matrix, false, td.u_terrain_matrix);
+            gl.uniform1f(this.p1U.u_terrain_dim, td.u_terrain_dim);
+            gl.uniform4fv(this.p1U.u_terrain_unpack, td.u_terrain_unpack);
+            gl.uniform1f(this.p1U.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+            const mesh = terrain.getTerrainMesh(tileID);
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+            gl.enableVertexAttribArray(this.p1A.aPos3d);
+            gl.vertexAttribPointer(this.p1A.aPos3d, 3, gl.SHORT, false, 0, 0);
+            gl.drawElements(
+                gl.TRIANGLES,
+                mesh.segments.get()[0].primitiveLength * 3,
+                gl.UNSIGNED_SHORT, 0
+            );
+        }
+
+        // Restore framebuffer; painter will reset its viewport for Pass 2.
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        this.map.painter.context.bindFramebuffer.dirty = true;
+
+        // Stash for render() use
+        this._aoi = aoi;
+    },
+    render(gl, args) {
+        // Pass 2 — main on-screen render with viewshed analysis.
+        const aoi = this._aoi;
+        const terrain = this.map.terrain;
+        if (!aoi || !terrain) return;
+
+        const {program, aPos3d, u} = this._getPass2Program(gl, args.shaderData);
+        gl.useProgram(program);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // G-buffer texture (slot 4)
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, this.gbufTex);
+        gl.uniform1i(u.u_gbuf, 4);
+        gl.uniform2f(u.u_gbuf_origin, aoi.mercX - aoi.half, aoi.mercY - aoi.half);
+        gl.uniform2f(u.u_gbuf_size, 2 * aoi.half, 2 * aoi.half);
+        gl.uniform1f(u.u_ele_min, ELE_MIN);
+        gl.uniform1f(u.u_ele_max, ELE_MAX);
+
+        gl.uniform3f(u.u_observer_merc, aoi.mercX, aoi.mercY, aoi.totalEle);
+        gl.uniform1f(u.u_observer_valid, 1.0);
+        gl.uniform1f(u.u_aoi_radius, aoi.half);
+        gl.uniform1f(u.u_bias, settings.biasM);
+        gl.uniform1i(u.u_steps, settings.steps);
+
+        const dpr = window.devicePixelRatio || 1;
+        gl.uniform2f(u.u_viewport,
+                     gl.canvas.width / dpr, gl.canvas.height / dpr);
+
+        const eleDelta = terrain.getMeshFrameDelta(this.map.transform.zoom);
+        gl.uniform1f(u.u_ele_delta, eleDelta);
+
+        for (const tile of terrain.tileManager.getRenderableTiles()) {
+            const tileID = tile.tileID;
+            const td = terrain.getTerrainData(tileID);
+
+            // Projection uniforms — official prelude requires the full set.
             const proj = this.map.transform.getProjectionData({
                 overscaledTileID: tileID,
                 applyTerrainMatrix: false,
                 applyGlobeMatrix: true
             });
+            gl.uniformMatrix4fv(u.u_projection_matrix, false, proj.mainMatrix);
+            gl.uniformMatrix4fv(u.u_projection_fallback_matrix, false, proj.fallbackMatrix);
+            gl.uniform4f(u.u_projection_clipping_plane, ...proj.clippingPlane);
+            gl.uniform1f(u.u_projection_transition, proj.projectionTransition);
+            gl.uniform4f(u.u_projection_tile_mercator_coords, ...proj.tileMercatorCoords);
 
-            gl.uniformMatrix4fv(this.u.u_projection_matrix, false, proj.mainMatrix);
-
-            // Terrain DEM bindings (slot 2)
+            // Terrain DEM (slot 2)
             gl.activeTexture(gl.TEXTURE2);
             gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
-            gl.uniform1i(this.u.u_terrain, 2);
-            gl.uniformMatrix4fv(this.u.u_terrain_matrix, false, td.u_terrain_matrix);
-            gl.uniform1f(this.u.u_terrain_dim, td.u_terrain_dim);
-            gl.uniform4fv(this.u.u_terrain_unpack, td.u_terrain_unpack);
-            gl.uniform1f(this.u.u_terrain_exaggeration, td.u_terrain_exaggeration);
+            gl.uniform1i(u.u_terrain, 2);
+            gl.uniformMatrix4fv(u.u_terrain_matrix, false, td.u_terrain_matrix);
+            gl.uniform1f(u.u_terrain_dim, td.u_terrain_dim);
+            gl.uniform4fv(u.u_terrain_unpack, td.u_terrain_unpack);
+            gl.uniform1f(u.u_terrain_exaggeration, td.u_terrain_exaggeration);
 
-            // Terrain depth FBO as G-buffer (slot 3)
+            // Terrain depth FBO for Depth Replacement (slot 3)
             gl.activeTexture(gl.TEXTURE3);
             gl.bindTexture(gl.TEXTURE_2D, td.depthTexture);
-            gl.uniform1i(this.u.u_depth, 3);
+            gl.uniform1i(u.u_depth, 3);
 
-            // Reuse terrain mesh (Pos3dArray, packed Int16x3)
             const mesh = terrain.getTerrainMesh(tileID);
             gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
-            gl.enableVertexAttribArray(this.aPos3d);
-            gl.vertexAttribPointer(this.aPos3d, 3, gl.SHORT, false, 0, 0);
+            gl.enableVertexAttribArray(aPos3d);
+            gl.vertexAttribPointer(aPos3d, 3, gl.SHORT, false, 0, 0);
             gl.drawElements(
                 gl.TRIANGLES,
                 mesh.segments.get()[0].primitiveLength * 3,
