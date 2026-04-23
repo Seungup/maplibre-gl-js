@@ -391,8 +391,17 @@ const viewshedLayer = {
             float unpackPacked(vec4 rgba) {
                 return dot(rgba, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0));
             }
+            // Matches MapLibre's terrain depth pack in
+            // src/shaders/glsl/terrain_depth.fragment.glsl (256-based big-endian)
+            // and unpack in _prelude.vertex.glsl:101-105.
             float unpackDepth(vec4 rgba) {
-                return dot(rgba, vec4(1.0/16581375.0, 1.0/65025.0, 1.0/255.0, 1.0));
+                const vec4 bitShifts = vec4(
+                    1.0 / (256.0 * 256.0 * 256.0),
+                    1.0 / (256.0 * 256.0),
+                    1.0 / 256.0,
+                    1.0
+                );
+                return dot(rgba, bitShifts);
             }
             float gbufElevation(vec2 merc) {
                 vec2 uv = (merc - u_gbuf_origin) / u_gbuf_size;
@@ -498,21 +507,30 @@ const viewshedLayer = {
 
     prerender(gl, args) {
         // Pass 1 — generate G-buffer (top-down ortho elevation around observer).
+        // Clear stashed AOI first so that render() won't use stale data when
+        // the observer is cleared via the reset button.
+        this._aoi = null;
+
         const aoi = this._computeObserverAoi();
         if (!aoi) return;
         const terrain = this.map.terrain;
 
         // Bind G-buffer FBO and prepare state.
+        // IMPORTANT: depthMask/colorMask must be TRUE *before* gl.clear,
+        // otherwise the attachments they gate won't be cleared. Painter may
+        // have left them disabled from a previous layer draw.
         gl.bindFramebuffer(gl.FRAMEBUFFER, this.gbufFBO);
         gl.viewport(0, 0, GBUF_SIZE, GBUF_SIZE);
-        gl.clearColor(0, 0, 0, 0);
-        gl.clearDepth(1);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.disable(gl.BLEND);
+        gl.disable(gl.CULL_FACE);
+        gl.disable(gl.STENCIL_TEST);   // painter may have left it enabled
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LEQUAL);
         gl.depthMask(true);
-        gl.disable(gl.BLEND);
-        gl.disable(gl.CULL_FACE);
+        gl.colorMask(true, true, true, true);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clearDepth(1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         gl.useProgram(this.pass1Program);
         gl.uniformMatrix4fv(this.p1U.u_ortho_merc, false, aoi.ortho);
