@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>RF signal propagation on terrain</title>
+    <meta property="og:description" content="GPU RF coverage prediction using Arch 4 + G-buffer: computes free-space path loss, first-Fresnel-zone clearance, and knife-edge diffraction against terrain for a transmitter, and visualizes received signal strength in dBm." />
+    <meta property="og:created" content="2026-04-23" />
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="../../dist/maplibre-gl.css" />
+    <script src="../../dist/maplibre-gl-dev.js"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        html, body, #map { height: 100%; }
+        #panel {
+            position: absolute; top: 12px; left: 12px;
+            background: rgba(255, 255, 255, 0.94);
+            padding: 12px 14px; border-radius: 6px;
+            font: 12px/1.4 sans-serif; color: #222;
+            min-width: 260px; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+        }
+        #panel h4 { margin: 0 0 8px 0; font-size: 13px; }
+        #panel label { display: block; margin: 6px 0 2px; }
+        #panel input[type=range] { width: 100%; }
+        #panel button { margin-top: 8px; }
+        #panel .hint { color: #555; margin-top: 8px; font-size: 11px; }
+        #legend {
+            position: absolute; bottom: 18px; left: 12px;
+            background: rgba(255,255,255,0.92); padding: 8px 10px;
+            border-radius: 6px; font: 11px/1.3 sans-serif;
+            box-shadow: 0 1px 4px rgba(0,0,0,.2);
+        }
+        #legend .bar {
+            width: 240px; height: 14px; margin-bottom: 4px;
+            background: linear-gradient(to right,
+                rgba(100,20,20,.8) 0%,
+                rgba(255,80,0,.8) 15%,
+                rgba(255,180,0,.8) 40%,
+                rgba(230,230,40,.8) 60%,
+                rgba(40,180,50,.9) 85%,
+                rgba(20,120,220,.9) 100%);
+        }
+        #legend .ticks { display: flex; justify-content: space-between; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+    <h4>RF Signal Propagation</h4>
+    <label>TX height: <span id="heightLabel">30</span> m</label>
+    <input type="range" id="height" min="1" max="150" value="30" step="1">
+    <label>Frequency: <span id="freqLabel">900</span> MHz</label>
+    <input type="range" id="freq" min="50" max="6000" value="900" step="10">
+    <label>TX power: <span id="powerLabel">36</span> dBm</label>
+    <input type="range" id="power" min="10" max="50" value="36" step="1">
+    <label>RX sensitivity: <span id="sensLabel">-100</span> dBm</label>
+    <input type="range" id="sens" min="-120" max="-60" value="-100" step="1">
+    <label>Max range: <span id="rangeLabel">15</span> km</label>
+    <input type="range" id="range" min="1" max="60" value="15" step="1">
+    <label>Fresnel clearance: <span id="fresnelLabel">60</span> %</label>
+    <input type="range" id="fresnel" min="0" max="100" value="60" step="5">
+    <label>Ray-march steps: <span id="stepsLabel">128</span></label>
+    <input type="range" id="steps" min="32" max="256" value="128" step="8">
+    <button id="reset">Reset transmitter</button>
+    <div class="hint">Click on the map to place the transmitter.<br>
+        Color = received power (dBm). Dark red = no line-of-sight.</div>
+</div>
+<div id="legend">
+    <div class="bar"></div>
+    <div class="ticks">
+        <span id="lgLo">-120</span>
+        <span>weak</span>
+        <span>marginal</span>
+        <span>strong</span>
+        <span id="lgHi">-40</span>
+        <span>dBm</span>
+    </div>
+</div>
+<script>
+// =============================================================================
+// RF Signal Propagation on Terrain — Arch 4 + G-buffer + physics
+//
+// Pass 1 (prerender):
+//   Top-down orthographic elevation G-buffer around the transmitter, in
+//   mercator space. Fragment writes packed elevation. Identical to the
+//   viewshed example's Pass 1 — the G-buffer is the "DEM slice" we'll
+//   probe during ray-marching.
+//
+// Pass 2 (render, translucent):
+//   Reuse the terrain mesh (terrain.getTerrainMesh) and the official
+//   prelude (shaderData.vertexShaderPrelude → projectTileFor3D). For each
+//   fragment we run a small RF link-budget simulation along the path
+//   from TX to that fragment:
+//     - Ray-march against the G-buffer for a line-of-sight check.
+//     - At each step, compute the first Fresnel zone radius and track
+//       how much terrain intrudes into the requested clearance.
+//     - Compute free-space path loss (FSPL) for the 3D distance.
+//     - Approximate a knife-edge diffraction loss proportional to the
+//       worst Fresnel intrusion.
+//     - Combine to produce received signal strength in dBm.
+//   Color maps dBm → a perceptual scale (no-signal → strong).
+//   gl_FragDepth is replaced with the base terrain's depth FBO to keep
+//   skirt z-fighting away (same Depth Replacement pattern as viewshed).
+//
+// This example is a didactic demonstration of combining:
+//   - Arch 4 pattern (terrain mesh reuse + projectTileFor3D)
+//   - G-buffer pattern (MapLibre-compatible pack/unpack)
+//   - A multi-factor physics calculation in the fragment shader
+// It is NOT a substitute for a production RF planning tool (no Okumura-
+// Hata, COST231, ITU-R P.525/P.526 full implementation, no ground
+// reflection, no atmospheric absorption, no antenna radiation pattern).
+// =============================================================================
+
+const GBUF_SIZE = 1024;
+const ELE_MIN   = -500;
+const ELE_MAX   = 9000;
+
+function orthoMatrix(l, r, b, t, n, f) {
+    const m = new Float32Array(16);
+    m[0]  = 2 / (r - l);
+    m[5]  = 2 / (t - b);
+    m[10] = -2 / (f - n);
+    m[12] = -(r + l) / (r - l);
+    m[13] = -(t + b) / (t - b);
+    m[14] = -(f + n) / (f - n);
+    m[15] = 1;
+    return m;
+}
+
+const map = new maplibregl.Map({
+    container: 'map',
+    zoom: 11.5,
+    center: [11.39085, 47.27574],
+    pitch: 65,
+    bearing: -20,
+    maxPitch: 85,
+    style: {
+        version: 8,
+        sources: {
+            osm: {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                attribution: '&copy; OpenStreetMap Contributors',
+                maxzoom: 19
+            },
+            terrainSource: {
+                type: 'raster-dem',
+                url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
+                tileSize: 256
+            }
+        },
+        layers: [{id: 'osm', type: 'raster', source: 'osm'}],
+        terrain: {source: 'terrainSource', exaggeration: 1.0}
+    }
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch: true}));
+
+// -----------------------------------------------------------------------------
+// Transmitter state + UI
+// -----------------------------------------------------------------------------
+const tx = {lngLat: null, height: 30, marker: null};
+const params = {
+    frequencyMhz: 900,
+    powerDbm: 36,
+    sensitivityDbm: -100,
+    maxRangeM: 15000,
+    fresnelClearance: 0.60,
+    steps: 128
+};
+
+map.on('click', (e) => {
+    tx.lngLat = e.lngLat;
+    if (tx.marker) tx.marker.remove();
+    const el = document.createElement('div');
+    el.style.cssText = 'width:14px;height:14px;border-radius:50%;background:#2255ff;border:2px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5);';
+    tx.marker = new maplibregl.Marker({element: el}).setLngLat(e.lngLat).addTo(map);
+    map.triggerRepaint();
+});
+const bind = (id, labelId, transform, setter) => {
+    const input = document.getElementById(id);
+    const label = document.getElementById(labelId);
+    input.oninput = (e) => {
+        const v = +e.target.value;
+        setter(transform ? transform(v) : v);
+        label.textContent = e.target.value;
+        map.triggerRepaint();
+    };
+};
+bind('height',  'heightLabel',  null, v => tx.height = v);
+bind('freq',    'freqLabel',    null, v => params.frequencyMhz = v);
+bind('power',   'powerLabel',   null, v => params.powerDbm = v);
+bind('sens',    'sensLabel',    null, v => params.sensitivityDbm = v);
+bind('range',   'rangeLabel',   v => v * 1000, v => params.maxRangeM = v);
+bind('fresnel', 'fresnelLabel', v => v / 100,  v => params.fresnelClearance = v);
+bind('steps',   'stepsLabel',   null, v => params.steps = v);
+document.getElementById('reset').onclick = () => {
+    tx.lngLat = null;
+    if (tx.marker) { tx.marker.remove(); tx.marker = null; }
+    map.triggerRepaint();
+};
+
+// =============================================================================
+// Custom RF Layer
+// =============================================================================
+const rfLayer = {
+    id: 'rf',
+    type: 'custom',
+    renderingMode: '3d',
+
+    onAdd(mapInstance, gl) {
+        this.map = mapInstance;
+        this._setupGBuffer(gl);
+        this._setupPass1Program(gl);
+        this.pass2Cache = new Map();
+    },
+
+    onRemove(mapInstance, gl) {
+        if (this.gbufFBO) gl.deleteFramebuffer(this.gbufFBO);
+        if (this.gbufTex) gl.deleteTexture(this.gbufTex);
+        if (this.gbufDepth) gl.deleteRenderbuffer(this.gbufDepth);
+        if (this.pass1Program) gl.deleteProgram(this.pass1Program);
+        if (this.pass2Cache) {
+            for (const v of this.pass2Cache.values()) gl.deleteProgram(v.program);
+        }
+    },
+
+    _setupGBuffer(gl) {
+        this.gbufTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, this.gbufTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, GBUF_SIZE, GBUF_SIZE, 0,
+                      gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        this.gbufDepth = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, this.gbufDepth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16,
+                               GBUF_SIZE, GBUF_SIZE);
+
+        this.gbufFBO = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.gbufFBO);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+                                gl.TEXTURE_2D, this.gbufTex, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT,
+                                   gl.RENDERBUFFER, this.gbufDepth);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+    },
+
+    _setupPass1Program(gl) {
+        const vs = `#version 300 es
+            precision highp float;
+            in vec3 a_pos3d;
+            uniform mat4 u_ortho_merc;
+            uniform vec4 u_projection_tile_mercator_coords;
+            uniform sampler2D u_terrain;
+            uniform mat4 u_terrain_matrix;
+            uniform float u_terrain_dim;
+            uniform vec4 u_terrain_unpack;
+            uniform float u_terrain_exaggeration;
+            uniform float u_ele_delta;
+            out float v_ele;
+
+            float ele(vec2 pos) {
+                vec4 rgb = (texture(u_terrain, pos) * 255.0) * u_terrain_unpack;
+                return rgb.r + rgb.g + rgb.b - u_terrain_unpack.a;
+            }
+            float get_elevation(vec2 pos) {
+                vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+                vec2 f = fract(coord);
+                vec2 c = (floor(coord) + 0.5) / (u_terrain_dim + 2.0);
+                float d = 1.0 / (u_terrain_dim + 2.0);
+                float tl = ele(c);
+                float tr = ele(c + vec2(d, 0.0));
+                float bl = ele(c + vec2(0.0, d));
+                float br = ele(c + vec2(d, d));
+                return mix(mix(tl, tr, f.x), mix(bl, br, f.x), f.y) * u_terrain_exaggeration;
+            }
+
+            void main() {
+                float e = get_elevation(a_pos3d.xy);
+                float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+                vec2 mercFrac = a_pos3d.xy / 8192.0;
+                vec2 merc = u_projection_tile_mercator_coords.xy
+                          + u_projection_tile_mercator_coords.zw * mercFrac;
+                gl_Position = u_ortho_merc * vec4(merc, e - ele_delta, 1.0);
+                v_ele = e;
+            }`;
+
+        const fs = `#version 300 es
+            precision highp float;
+            in float v_ele;
+            uniform float u_ele_min;
+            uniform float u_ele_max;
+            out vec4 fragColor;
+
+            vec4 packFloat(float v) {
+                v = clamp(v, 0.0, 1.0);
+                vec4 enc = vec4(1.0, 255.0, 65025.0, 16581375.0) * v;
+                enc = fract(enc);
+                enc -= enc.yzww * vec4(1.0/255.0, 1.0/255.0, 1.0/255.0, 0.0);
+                return enc;
+            }
+            void main() {
+                float n = (v_ele - u_ele_min) / (u_ele_max - u_ele_min);
+                fragColor = packFloat(n);
+            }`;
+
+        const compile = (type, src, label) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(`RF Pass1 ${label}: ` + gl.getShaderInfoLog(s));
+            }
+            return s;
+        };
+        this.pass1Program = gl.createProgram();
+        gl.attachShader(this.pass1Program, compile(gl.VERTEX_SHADER, vs, 'vertex'));
+        gl.attachShader(this.pass1Program, compile(gl.FRAGMENT_SHADER, fs, 'fragment'));
+        gl.linkProgram(this.pass1Program);
+        if (!gl.getProgramParameter(this.pass1Program, gl.LINK_STATUS)) {
+            console.error('RF Pass1 link: ' + gl.getProgramInfoLog(this.pass1Program));
+        }
+
+        this.p1A = {aPos3d: gl.getAttribLocation(this.pass1Program, 'a_pos3d')};
+        this.p1U = {};
+        for (const n of [
+            'u_ortho_merc', 'u_projection_tile_mercator_coords',
+            'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
+            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
+            'u_ele_min', 'u_ele_max'
+        ]) this.p1U[n] = gl.getUniformLocation(this.pass1Program, n);
+    },
+
+    _getPass2Program(gl, shaderData) {
+        const key = shaderData.variantName;
+        if (this.pass2Cache.has(key)) return this.pass2Cache.get(key);
+
+        const vs = `#version 300 es
+            precision highp float;
+            ${shaderData.vertexShaderPrelude}
+            ${shaderData.define}
+
+            #ifndef GLOBE
+            uniform vec4 u_projection_tile_mercator_coords;
+            #endif
+
+            in vec3 a_pos3d;
+
+            uniform sampler2D u_terrain;
+            uniform mat4 u_terrain_matrix;
+            uniform float u_terrain_dim;
+            uniform vec4 u_terrain_unpack;
+            uniform float u_terrain_exaggeration;
+            uniform float u_ele_delta;
+
+            out vec2 v_frag_merc;
+            out float v_frag_ele;
+
+            float ele(vec2 pos) {
+                vec4 rgb = (texture(u_terrain, pos) * 255.0) * u_terrain_unpack;
+                return rgb.r + rgb.g + rgb.b - u_terrain_unpack.a;
+            }
+            float get_elevation(vec2 pos) {
+                vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+                vec2 f = fract(coord);
+                vec2 c = (floor(coord) + 0.5) / (u_terrain_dim + 2.0);
+                float d = 1.0 / (u_terrain_dim + 2.0);
+                float tl = ele(c);
+                float tr = ele(c + vec2(d, 0.0));
+                float bl = ele(c + vec2(0.0, d));
+                float br = ele(c + vec2(d, d));
+                return mix(mix(tl, tr, f.x), mix(bl, br, f.x), f.y) * u_terrain_exaggeration;
+            }
+
+            void main() {
+                float e = get_elevation(a_pos3d.xy);
+                float ele_delta = a_pos3d.z == 1.0 ? u_ele_delta : 0.0;
+                gl_Position = projectTileFor3D(a_pos3d.xy, e - ele_delta);
+
+                vec2 mercFrac = a_pos3d.xy / 8192.0;
+                v_frag_merc = u_projection_tile_mercator_coords.xy
+                            + u_projection_tile_mercator_coords.zw * mercFrac;
+                v_frag_ele = e;
+            }`;
+
+        const fs = `#version 300 es
+            precision highp float;
+            in vec2 v_frag_merc;
+            in float v_frag_ele;
+
+            // G-buffer (elevation)
+            uniform sampler2D u_gbuf;
+            uniform vec2 u_gbuf_origin;
+            uniform vec2 u_gbuf_size;
+            uniform float u_ele_min;
+            uniform float u_ele_max;
+
+            // Transmitter
+            uniform vec3 u_tx_merc;               // (merc.x, merc.y, tx elevation m)
+            uniform float u_merc_per_meter;       // local conversion factor
+
+            // Link-budget
+            uniform float u_freq_mhz;
+            uniform float u_tx_dbm;
+            uniform float u_sens_dbm;
+            uniform float u_max_range_m;
+            uniform float u_fresnel_clearance;    // 0..1 (fraction of first Fresnel)
+            uniform int u_steps;
+
+            // Depth Replacement
+            uniform highp sampler2D u_depth;
+            uniform vec2 u_viewport;
+
+            out vec4 fragColor;
+
+            float unpackPacked(vec4 rgba) {
+                return dot(rgba, vec4(1.0, 1.0/255.0, 1.0/65025.0, 1.0/16581375.0));
+            }
+            float unpackDepth(vec4 rgba) {
+                const vec4 bs = vec4(
+                    1.0/(256.0*256.0*256.0),
+                    1.0/(256.0*256.0),
+                    1.0/256.0, 1.0);
+                return dot(rgba, bs);
+            }
+            float gbufElevation(vec2 merc) {
+                vec2 uv = (merc - u_gbuf_origin) / u_gbuf_size;
+                if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return -9999.0;
+                return mix(u_ele_min, u_ele_max, unpackPacked(texture(u_gbuf, uv)));
+            }
+
+            // Perceptual color ramp for dBm level (0..1 normalized).
+            // 0 = below sensitivity, 1 = very strong.
+            vec3 signalColor(float t) {
+                // Piecewise: deep red → orange → yellow → green → blue (strongest)
+                if (t < 0.15) return mix(vec3(0.40, 0.08, 0.08), vec3(1.0, 0.31, 0.0), t / 0.15);
+                if (t < 0.40) return mix(vec3(1.0, 0.31, 0.0), vec3(1.0, 0.71, 0.0), (t - 0.15) / 0.25);
+                if (t < 0.60) return mix(vec3(1.0, 0.71, 0.0), vec3(0.90, 0.90, 0.16), (t - 0.40) / 0.20);
+                if (t < 0.85) return mix(vec3(0.90, 0.90, 0.16), vec3(0.16, 0.71, 0.20), (t - 0.60) / 0.25);
+                return mix(vec3(0.16, 0.71, 0.20), vec3(0.08, 0.47, 0.86), (t - 0.85) / 0.15);
+            }
+
+            void main() {
+                vec2 fragUV = gl_FragCoord.xy / u_viewport;
+                // Depth Replacement first — gl_FragDepth is written even if we discard.
+                gl_FragDepth = unpackDepth(texture(u_depth, fragUV));
+
+                vec2 txM = u_tx_merc.xy;
+                float txE = u_tx_merc.z;
+                vec2 fragM = v_frag_merc;
+                float fragE = v_frag_ele;
+
+                // Horizontal distance (meters) and 3D distance
+                float dMerc = length(fragM - txM);
+                float dHoriz_m = dMerc / u_merc_per_meter;
+                float dVert_m = fragE - txE;
+                float d3d_m = sqrt(dHoriz_m*dHoriz_m + dVert_m*dVert_m);
+
+                if (d3d_m > u_max_range_m) discard;
+                if (d3d_m < 1.0) {
+                    // Very close: mark as strong signal (prevents log(0))
+                    fragColor = vec4(0.08, 0.47, 0.86, 0.55);
+                    return;
+                }
+
+                // Wavelength in meters
+                float lambda = 299792458.0 / (u_freq_mhz * 1e6);
+
+                // Ray-march along TX → fragment, sampling G-buffer.
+                // Track:
+                //   losBlocked: hard obstruction (terrain above ray line)
+                //   maxIntrusionRatio: worst-case fraction of Fresnel clearance
+                //                      that terrain ate into, 0=no intrusion,
+                //                      1=terrain grazes clearance margin,
+                //                      >1=eats into direct LOS.
+                bool losBlocked = false;
+                float maxIntrusionRatio = 0.0;
+
+                int steps = u_steps;
+                for (int i = 1; i < 256; i++) {
+                    if (i >= steps - 1) break;
+                    float t = float(i) / float(steps);
+
+                    vec2 sM = mix(txM, fragM, t);
+                    float rayE = mix(txE, fragE, t);
+                    float terE = gbufElevation(sM);
+
+                    if (terE > rayE) { losBlocked = true; break; }
+
+                    // First Fresnel zone radius at this point (meters)
+                    float d1 = d3d_m * t;
+                    float d2 = d3d_m * (1.0 - t);
+                    float r1 = sqrt(max(0.0, lambda * d1 * d2 / d3d_m));
+                    float clearance = u_fresnel_clearance * r1;
+
+                    // Required minimum ray-to-terrain clearance = clearance.
+                    // Actual clearance = rayE - terE. Intrusion = clearance - actual.
+                    float actual = rayE - terE;
+                    float intrusion = clearance - actual;
+                    float ratio = clearance > 0.001 ? intrusion / clearance : 0.0;
+                    if (ratio > maxIntrusionRatio) maxIntrusionRatio = ratio;
+                }
+
+                if (losBlocked) {
+                    // Non-line-of-sight: render as deep dark red (no reliable signal)
+                    fragColor = vec4(0.22, 0.03, 0.03, 0.55);
+                    return;
+                }
+
+                // Free-space path loss (dB): FSPL = 20 log10(d_km) + 20 log10(f_MHz) + 32.45
+                float fspl_db = 20.0 * log(d3d_m / 1000.0) / log(10.0)
+                              + 20.0 * log(u_freq_mhz) / log(10.0)
+                              + 32.45;
+
+                // Simplified knife-edge diffraction loss from Fresnel intrusion.
+                // If ratio in (0, 1]: loss grows from 0 to ~6 dB (partial clearance).
+                // If ratio > 1 (eating into LOS): larger penalty up to ~20 dB.
+                float diff_db = 0.0;
+                if (maxIntrusionRatio > 0.0) {
+                    float r = maxIntrusionRatio;
+                    diff_db = 6.0 * clamp(r, 0.0, 1.0)
+                            + 14.0 * clamp(r - 1.0, 0.0, 1.0);
+                }
+
+                float rx_dbm = u_tx_dbm - fspl_db - diff_db;
+
+                if (rx_dbm < u_sens_dbm) discard;
+
+                // Map dBm → 0..1 for color ramp.
+                // Range: [sens, -40] dBm typical
+                float norm = (rx_dbm - u_sens_dbm) / (-40.0 - u_sens_dbm);
+                norm = clamp(norm, 0.0, 1.0);
+
+                fragColor = vec4(signalColor(norm), 0.55);
+            }`;
+
+        const compile = (type, src, label) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(`RF Pass2[${key}] ${label}: ` + gl.getShaderInfoLog(s));
+            }
+            return s;
+        };
+        const program = gl.createProgram();
+        gl.attachShader(program, compile(gl.VERTEX_SHADER, vs, 'vertex'));
+        gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fs, 'fragment'));
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            console.error(`RF Pass2[${key}] link: ` + gl.getProgramInfoLog(program));
+        }
+
+        const aPos3d = gl.getAttribLocation(program, 'a_pos3d');
+        const u = {};
+        for (const n of [
+            'u_projection_matrix', 'u_projection_fallback_matrix',
+            'u_projection_clipping_plane', 'u_projection_transition',
+            'u_projection_tile_mercator_coords',
+            'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
+            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
+            'u_gbuf', 'u_gbuf_origin', 'u_gbuf_size',
+            'u_ele_min', 'u_ele_max',
+            'u_tx_merc', 'u_merc_per_meter',
+            'u_freq_mhz', 'u_tx_dbm', 'u_sens_dbm',
+            'u_max_range_m', 'u_fresnel_clearance', 'u_steps',
+            'u_depth', 'u_viewport'
+        ]) u[n] = gl.getUniformLocation(program, n);
+
+        const entry = {program, aPos3d, u};
+        this.pass2Cache.set(key, entry);
+        return entry;
+    },
+
+    _computeAoi() {
+        const terrain = this.map.terrain;
+        if (!tx.lngLat || !terrain) return null;
+        const groundEle = this.map.queryTerrainElevation(tx.lngLat) || 0;
+        const totalEle = groundEle + tx.height;
+        const merc = maplibregl.MercatorCoordinate.fromLngLat(tx.lngLat, 0);
+        const mpu = merc.meterInMercatorCoordinateUnits();
+        // G-buffer covers slightly more than max-range for safety margin.
+        const half = (params.maxRangeM * 1.1) * mpu;
+        return {
+            mercX: merc.x,
+            mercY: merc.y,
+            totalEle,
+            half,
+            mpu,
+            ortho: orthoMatrix(
+                merc.x - half, merc.x + half,
+                merc.y + half, merc.y - half,
+                ELE_MIN, ELE_MAX
+            )
+        };
+    },
+
+    prerender(gl, args) {
+        this._aoi = null;
+        const aoi = this._computeAoi();
+        if (!aoi) return;
+        const terrain = this.map.terrain;
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.gbufFBO);
+        gl.viewport(0, 0, GBUF_SIZE, GBUF_SIZE);
+        gl.disable(gl.BLEND);
+        gl.disable(gl.CULL_FACE);
+        gl.disable(gl.STENCIL_TEST);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.depthMask(true);
+        gl.colorMask(true, true, true, true);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clearDepth(1);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        gl.useProgram(this.pass1Program);
+        gl.uniformMatrix4fv(this.p1U.u_ortho_merc, false, aoi.ortho);
+        gl.uniform1f(this.p1U.u_ele_min, ELE_MIN);
+        gl.uniform1f(this.p1U.u_ele_max, ELE_MAX);
+        const eleDelta = terrain.getMeshFrameDelta(this.map.transform.zoom);
+        gl.uniform1f(this.p1U.u_ele_delta, eleDelta);
+
+        for (const tile of terrain.tileManager.getRenderableTiles()) {
+            const tileID = tile.tileID;
+            const c = tileID.canonical;
+            const scale = 1 / (1 << c.z);
+            const tileLeft = c.x * scale + tileID.wrap;
+            const tileTop  = c.y * scale;
+            if (tileLeft + scale < aoi.mercX - aoi.half ||
+                tileLeft > aoi.mercX + aoi.half ||
+                tileTop + scale < aoi.mercY - aoi.half ||
+                tileTop > aoi.mercY + aoi.half) continue;
+
+            const td = terrain.getTerrainData(tileID);
+            gl.uniform4f(this.p1U.u_projection_tile_mercator_coords,
+                         tileLeft, tileTop, scale, scale);
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+            gl.uniform1i(this.p1U.u_terrain, 2);
+            gl.uniformMatrix4fv(this.p1U.u_terrain_matrix, false, td.u_terrain_matrix);
+            gl.uniform1f(this.p1U.u_terrain_dim, td.u_terrain_dim);
+            gl.uniform4fv(this.p1U.u_terrain_unpack, td.u_terrain_unpack);
+            gl.uniform1f(this.p1U.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+            const mesh = terrain.getTerrainMesh(tileID);
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+            gl.enableVertexAttribArray(this.p1A.aPos3d);
+            gl.vertexAttribPointer(this.p1A.aPos3d, 3, gl.SHORT, false, 0, 0);
+            gl.drawElements(
+                gl.TRIANGLES,
+                mesh.segments.get()[0].primitiveLength * 3,
+                gl.UNSIGNED_SHORT, 0
+            );
+        }
+
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        this.map.painter.context.bindFramebuffer.dirty = true;
+        this._aoi = aoi;
+    },
+
+    render(gl, args) {
+        const aoi = this._aoi;
+        const terrain = this.map.terrain;
+        if (!aoi || !terrain) return;
+
+        const {program, aPos3d, u} = this._getPass2Program(gl, args.shaderData);
+        gl.useProgram(program);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // G-buffer (slot 4)
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, this.gbufTex);
+        gl.uniform1i(u.u_gbuf, 4);
+        gl.uniform2f(u.u_gbuf_origin, aoi.mercX - aoi.half, aoi.mercY - aoi.half);
+        gl.uniform2f(u.u_gbuf_size, 2 * aoi.half, 2 * aoi.half);
+        gl.uniform1f(u.u_ele_min, ELE_MIN);
+        gl.uniform1f(u.u_ele_max, ELE_MAX);
+
+        // Transmitter & link budget
+        gl.uniform3f(u.u_tx_merc, aoi.mercX, aoi.mercY, aoi.totalEle);
+        gl.uniform1f(u.u_merc_per_meter, aoi.mpu);
+        gl.uniform1f(u.u_freq_mhz, params.frequencyMhz);
+        gl.uniform1f(u.u_tx_dbm, params.powerDbm);
+        gl.uniform1f(u.u_sens_dbm, params.sensitivityDbm);
+        gl.uniform1f(u.u_max_range_m, params.maxRangeM);
+        gl.uniform1f(u.u_fresnel_clearance, params.fresnelClearance);
+        gl.uniform1i(u.u_steps, params.steps);
+
+        const dpr = window.devicePixelRatio || 1;
+        gl.uniform2f(u.u_viewport, gl.canvas.width / dpr, gl.canvas.height / dpr);
+
+        const eleDelta = terrain.getMeshFrameDelta(this.map.transform.zoom);
+        gl.uniform1f(u.u_ele_delta, eleDelta);
+
+        for (const tile of terrain.tileManager.getRenderableTiles()) {
+            const tileID = tile.tileID;
+            const td = terrain.getTerrainData(tileID);
+            const proj = this.map.transform.getProjectionData({
+                overscaledTileID: tileID,
+                applyTerrainMatrix: false,
+                applyGlobeMatrix: true
+            });
+            gl.uniformMatrix4fv(u.u_projection_matrix, false, proj.mainMatrix);
+            gl.uniformMatrix4fv(u.u_projection_fallback_matrix, false, proj.fallbackMatrix);
+            gl.uniform4f(u.u_projection_clipping_plane, ...proj.clippingPlane);
+            gl.uniform1f(u.u_projection_transition, proj.projectionTransition);
+            gl.uniform4f(u.u_projection_tile_mercator_coords, ...proj.tileMercatorCoords);
+
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+            gl.uniform1i(u.u_terrain, 2);
+            gl.uniformMatrix4fv(u.u_terrain_matrix, false, td.u_terrain_matrix);
+            gl.uniform1f(u.u_terrain_dim, td.u_terrain_dim);
+            gl.uniform4fv(u.u_terrain_unpack, td.u_terrain_unpack);
+            gl.uniform1f(u.u_terrain_exaggeration, td.u_terrain_exaggeration);
+
+            gl.activeTexture(gl.TEXTURE3);
+            gl.bindTexture(gl.TEXTURE_2D, td.depthTexture);
+            gl.uniform1i(u.u_depth, 3);
+
+            const mesh = terrain.getTerrainMesh(tileID);
+            gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mesh.indexBuffer.buffer);
+            gl.enableVertexAttribArray(aPos3d);
+            gl.vertexAttribPointer(aPos3d, 3, gl.SHORT, false, 0, 0);
+            gl.drawElements(
+                gl.TRIANGLES,
+                mesh.segments.get()[0].primitiveLength * 3,
+                gl.UNSIGNED_SHORT, 0
+            );
+        }
+    }
+};
+
+// Update legend as sens changes
+const updateLegend = () => {
+    document.getElementById('lgLo').textContent = params.sensitivityDbm;
+    document.getElementById('lgHi').textContent = '-40';
+};
+document.getElementById('sens').addEventListener('input', updateLegend);
+updateLegend();
+
+map.on('style.load', () => { map.addLayer(rfLayer); });
+</script>
+</body>
+</html>
