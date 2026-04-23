@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Missile trajectory simulation on terrain</title>
+    <meta property="og:description" content="Simple ballistic missile simulator: user places a launcher and a target, the missile is fired with a computed initial velocity, flight is integrated in real time, terrain collision is checked via map.queryTerrainElevation, and the trajectory is rendered via a custom layer." />
+    <meta property="og:created" content="2026-04-23" />
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="../../dist/maplibre-gl.css" />
+    <script src="../../dist/maplibre-gl-dev.js"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        html, body, #map { height: 100%; }
+        #panel {
+            position: absolute; top: 12px; left: 12px;
+            background: rgba(255, 255, 255, 0.94);
+            padding: 12px 14px; border-radius: 6px;
+            font: 12px/1.4 sans-serif; color: #222;
+            min-width: 250px; box-shadow: 0 1px 4px rgba(0,0,0,.2);
+        }
+        #panel h4 { margin: 0 0 8px 0; font-size: 13px; }
+        #panel label { display: block; margin: 6px 0 2px; }
+        #panel input[type=range] { width: 100%; }
+        #panel button { margin-top: 6px; padding: 6px 10px; }
+        #panel .status {
+            margin-top: 10px; padding: 6px 8px;
+            background: #f3f4f6; border-left: 3px solid #60a5fa;
+            font: 11px monospace;
+        }
+        #panel .hint { color: #555; margin-top: 8px; font-size: 11px; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+    <h4>Missile Simulator</h4>
+    <label>Flight time: <span id="timeLabel">12</span> s</label>
+    <input type="range" id="time" min="3" max="60" value="12" step="1">
+    <label>Launcher height: <span id="launchHLabel">0</span> m AGL</label>
+    <input type="range" id="launchH" min="0" max="200" value="0" step="5">
+    <label>Target height: <span id="targetHLabel">0</span> m AGL</label>
+    <input type="range" id="targetH" min="0" max="200" value="0" step="5">
+    <label>Gravity: <span id="gLabel">9.81</span> m/s²</label>
+    <input type="range" id="g" min="1" max="25" value="981" step="1">
+    <div>
+        <button id="placeLauncher">① Place Launcher</button>
+        <button id="placeTarget">② Place Target</button>
+    </div>
+    <div>
+        <button id="launch">🚀 Launch</button>
+        <button id="reset">Reset</button>
+    </div>
+    <div class="status" id="status">Click "Place Launcher" then click on the map.</div>
+    <div class="hint">AGL = Above Ground Level. Flight time controls arc height.<br>
+        Gray line = trajectory. Orange dot = missile. Red ring = impact.</div>
+</div>
+<script>
+// =============================================================================
+// Simple Ballistic Missile Simulation — Arch 4 pattern
+//
+// Physics:
+//   - Local Cartesian frame at launcher lngLat, flat-earth approximation
+//     (ok for < 50 km ranges; world curvature ignored).
+//   - Given flight time T, launcher L and target P:
+//       v_xy  = (P.xy - L.xy) / T
+//       v_z   = (P.z - L.z) / T + 0.5 * g * T
+//     ⇒ unguided ballistic arc that reaches P at time T in absence of terrain.
+//   - Forward Euler integration; terrain collision via map.queryTerrainElevation
+//     evaluated at each step's lng/lat position.
+//
+// Rendering (custom layer, renderingMode: '3d'):
+//   - Trajectory trail: polyline in WORLD mercator coordinates, projected
+//     via map.transform.modelViewProjectionMatrix. Works for mercator and
+//     globe (matrix returns correct clip-space for world points).
+//   - Missile dot:    single screen-space point (gl.POINTS).
+//   - Impact marker:  ring-pulse quad billboarded at impact lngLat,
+//                     drawn on top of terrain.
+//
+// Reference:
+//   - Arch 4 + map.queryTerrainElevation pattern
+//   - Public API only: queryTerrainElevation, MercatorCoordinate,
+//     transform.modelViewProjectionMatrix, transform.worldSize
+// =============================================================================
+
+const EARTH_R = 6371000.0;
+
+function localFromLngLat(ll, origin) {
+    const dLng = (ll.lng - origin.lng) * Math.PI / 180;
+    const dLat = (ll.lat - origin.lat) * Math.PI / 180;
+    const x = dLng * EARTH_R * Math.cos(origin.lat * Math.PI / 180);
+    const y = dLat * EARTH_R;
+    return {x, y};
+}
+function lngLatFromLocal(local, origin) {
+    const dLat = local.y / EARTH_R;
+    const dLng = local.x / (EARTH_R * Math.cos(origin.lat * Math.PI / 180));
+    return new maplibregl.LngLat(
+        origin.lng + dLng * 180 / Math.PI,
+        origin.lat + dLat * 180 / Math.PI
+    );
+}
+// Apply a 4x4 matrix (column-major) to a homogeneous vec4 v.
+function mat4mul(m, v) {
+    return [
+        m[0]*v[0] + m[4]*v[1] + m[8] *v[2] + m[12]*v[3],
+        m[1]*v[0] + m[5]*v[1] + m[9] *v[2] + m[13]*v[3],
+        m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3],
+        m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3],
+    ];
+}
+
+const map = new maplibregl.Map({
+    container: 'map',
+    zoom: 11.5,
+    center: [11.39085, 47.27574],
+    pitch: 65,
+    bearing: -15,
+    maxPitch: 85,
+    style: {
+        version: 8,
+        sources: {
+            osm: {
+                type: 'raster',
+                tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+                tileSize: 256,
+                attribution: '&copy; OpenStreetMap Contributors',
+                maxzoom: 19
+            },
+            terrainSource: {
+                type: 'raster-dem',
+                url: 'https://demotiles.maplibre.org/terrain-tiles/tiles.json',
+                tileSize: 256
+            }
+        },
+        layers: [{id: 'osm', type: 'raster', source: 'osm'}],
+        terrain: {source: 'terrainSource', exaggeration: 1.0}
+    }
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch: true}));
+
+// -----------------------------------------------------------------------------
+// State + UI
+// -----------------------------------------------------------------------------
+const state = {
+    phase: 'idle',          // idle | placing-launcher | placing-target | armed | flying | exploded
+    launcher: null,         // {lngLat, groundEle, height}
+    target:   null,         // {lngLat, groundEle, height}
+    launcherMarker: null,
+    targetMarker: null,
+    // Physics: position & velocity in local meters relative to launcher
+    pos: null, vel: null,
+    trail: [],              // array of {x, y, z} in local meters
+    impact: null,           // {lngLat, alt}
+    lastTime: 0,
+    impactTime: 0,
+};
+const params = {
+    flightTimeSec: 12,
+    launcherHeight: 0,
+    targetHeight: 0,
+    gravity: 9.81,
+};
+
+const $ = id => document.getElementById(id);
+function setStatus(s) { $('status').textContent = s; }
+function makeMarker(color) {
+    return new maplibregl.Marker({color}).setLngLat([0, 0]);
+}
+
+$('time').oninput = (e) => {
+    params.flightTimeSec = +e.target.value;
+    $('timeLabel').textContent = e.target.value;
+};
+$('launchH').oninput = (e) => {
+    params.launcherHeight = +e.target.value;
+    $('launchHLabel').textContent = e.target.value;
+};
+$('targetH').oninput = (e) => {
+    params.targetHeight = +e.target.value;
+    $('targetHLabel').textContent = e.target.value;
+};
+$('g').oninput = (e) => {
+    params.gravity = (+e.target.value) / 100;
+    $('gLabel').textContent = params.gravity.toFixed(2);
+};
+
+$('placeLauncher').onclick = () => {
+    state.phase = 'placing-launcher';
+    setStatus('Click on the map to set the launcher.');
+};
+$('placeTarget').onclick = () => {
+    if (!state.launcher) { setStatus('Place the launcher first.'); return; }
+    state.phase = 'placing-target';
+    setStatus('Click on the map to set the target.');
+};
+$('launch').onclick = () => launch();
+$('reset').onclick = () => resetAll();
+
+map.on('click', (e) => {
+    if (state.phase === 'placing-launcher') {
+        const ground = map.queryTerrainElevation(e.lngLat) || 0;
+        state.launcher = {lngLat: e.lngLat, groundEle: ground, height: params.launcherHeight};
+        if (!state.launcherMarker) {
+            state.launcherMarker = makeMarker('#2255ff');
+            state.launcherMarker.addTo(map);
+        }
+        state.launcherMarker.setLngLat(e.lngLat);
+        state.phase = 'idle';
+        setStatus('Launcher placed. Now click "② Place Target".');
+        map.triggerRepaint();
+    } else if (state.phase === 'placing-target') {
+        const ground = map.queryTerrainElevation(e.lngLat) || 0;
+        state.target = {lngLat: e.lngLat, groundEle: ground, height: params.targetHeight};
+        if (!state.targetMarker) {
+            state.targetMarker = makeMarker('#cc2222');
+            state.targetMarker.addTo(map);
+        }
+        state.targetMarker.setLngLat(e.lngLat);
+        state.phase = 'armed';
+        const range = Math.hypot(
+            localFromLngLat(state.target.lngLat, state.launcher.lngLat).x,
+            localFromLngLat(state.target.lngLat, state.launcher.lngLat).y
+        );
+        setStatus(`Target placed. Range ${(range/1000).toFixed(2)} km. Press 🚀 Launch.`);
+        map.triggerRepaint();
+    }
+});
+
+function resetAll() {
+    state.phase = 'idle';
+    state.launcher = state.target = null;
+    state.pos = state.vel = null;
+    state.trail = [];
+    state.impact = null;
+    if (state.launcherMarker) { state.launcherMarker.remove(); state.launcherMarker = null; }
+    if (state.targetMarker)   { state.targetMarker.remove();   state.targetMarker = null; }
+    setStatus('Reset. Click "① Place Launcher" to begin.');
+    map.triggerRepaint();
+}
+
+function launch() {
+    if (!state.launcher || !state.target) {
+        setStatus('Need both launcher and target.');
+        return;
+    }
+    // Refresh ground elevations + heights (user may have moved sliders)
+    state.launcher.groundEle = map.queryTerrainElevation(state.launcher.lngLat) || 0;
+    state.target.groundEle   = map.queryTerrainElevation(state.target.lngLat) || 0;
+    state.launcher.height = params.launcherHeight;
+    state.target.height   = params.targetHeight;
+
+    const L = {x: 0, y: 0, z: state.launcher.groundEle + state.launcher.height};
+    const Plocal = localFromLngLat(state.target.lngLat, state.launcher.lngLat);
+    const P = {x: Plocal.x, y: Plocal.y, z: state.target.groundEle + state.target.height};
+    const g = params.gravity;
+    const T = params.flightTimeSec;
+
+    state.pos = {...L};
+    state.vel = {
+        x: (P.x - L.x) / T,
+        y: (P.y - L.y) / T,
+        z: (P.z - L.z) / T + 0.5 * g * T
+    };
+    state.trail = [{...L}];
+    state.impact = null;
+    state.phase = 'flying';
+    state.lastTime = performance.now();
+    setStatus(`Missile in flight — ETA ${T.toFixed(1)} s`);
+    map.triggerRepaint();
+    requestAnimationFrame(frame);
+}
+
+function frame() {
+    if (state.phase === 'exploded') {
+        map.triggerRepaint();
+        // Keep repainting for impact pulse animation for ~3 s
+        if (performance.now() - state.impactTime < 3000) {
+            requestAnimationFrame(frame);
+        }
+        return;
+    }
+    if (state.phase !== 'flying') return;
+
+    const now = performance.now();
+    const dt = Math.min(0.033, (now - state.lastTime) / 1000);
+    state.lastTime = now;
+
+    // Forward Euler
+    state.vel.z -= params.gravity * dt;
+    state.pos.x += state.vel.x * dt;
+    state.pos.y += state.vel.y * dt;
+    state.pos.z += state.vel.z * dt;
+    state.trail.push({...state.pos});
+    if (state.trail.length > 400) state.trail.shift();
+
+    // Terrain collision — sample ground at current lng/lat
+    const curLngLat = lngLatFromLocal(state.pos, state.launcher.lngLat);
+    const ground = map.queryTerrainElevation(curLngLat) || 0;
+    if (state.pos.z < ground) {
+        state.pos.z = ground;
+        state.impact = {lngLat: curLngLat, alt: ground};
+        state.phase = 'exploded';
+        state.impactTime = performance.now();
+        const targetLocal = localFromLngLat(state.target.lngLat, state.launcher.lngLat);
+        const miss = Math.hypot(state.pos.x - targetLocal.x, state.pos.y - targetLocal.y);
+        setStatus(`Impact! Miss distance ${miss.toFixed(1)} m from target.`);
+    }
+
+    map.triggerRepaint();
+    requestAnimationFrame(frame);
+}
+
+// -----------------------------------------------------------------------------
+// Custom Layer — draws trajectory trail, missile dot, and impact ring
+// -----------------------------------------------------------------------------
+const missileLayer = {
+    id: 'missile-sim',
+    type: 'custom',
+    renderingMode: '3d',
+
+    onAdd(mapInstance, gl) {
+        this.map = mapInstance;
+
+        // Shader: takes world-mercator (x, y, alt_m) and projects via
+        // transform.modelViewProjectionMatrix. Works for mercator & globe.
+        const vs = `#version 300 es
+            precision highp float;
+            in vec3 a_world;   // (mercX * worldSize, mercY * worldSize, altitude_m)
+            uniform mat4 u_mvp;
+            uniform float u_point_size;
+            out float v_progress;
+            void main() {
+                gl_Position = u_mvp * vec4(a_world, 1.0);
+                gl_PointSize = u_point_size;
+                v_progress = float(gl_VertexID);
+            }`;
+        const fs = `#version 300 es
+            precision highp float;
+            in float v_progress;
+            uniform vec4 u_color;
+            uniform float u_progress_max;
+            out vec4 fragColor;
+            void main() {
+                // Fade older trail segments
+                float age = u_progress_max > 0.0 ? v_progress / u_progress_max : 1.0;
+                float alpha = mix(0.15, 1.0, age);
+                fragColor = vec4(u_color.rgb, u_color.a * alpha);
+            }`;
+
+        const compile = (type, src, label) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                console.error(`Missile ${label}: ` + gl.getShaderInfoLog(s));
+            }
+            return s;
+        };
+        this.program = gl.createProgram();
+        gl.attachShader(this.program, compile(gl.VERTEX_SHADER, vs, 'vertex'));
+        gl.attachShader(this.program, compile(gl.FRAGMENT_SHADER, fs, 'fragment'));
+        gl.linkProgram(this.program);
+
+        this.aWorld = gl.getAttribLocation(this.program, 'a_world');
+        this.u = {};
+        for (const n of ['u_mvp', 'u_point_size', 'u_color', 'u_progress_max'])
+            this.u[n] = gl.getUniformLocation(this.program, n);
+
+        this.trailVBO = gl.createBuffer();
+        this.pointVBO = gl.createBuffer();
+
+        // Impact ring: quad at impact position
+        this.ringProgram = this._makeRingProgram(gl);
+        this.ringVBO = gl.createBuffer();
+        // Full-screen quad in normalized [-1..1] space (we'll position by uniform)
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.ringVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+            -1, -1,   1, -1,   -1, 1,
+             1, -1,   1,  1,   -1, 1,
+        ]), gl.STATIC_DRAW);
+    },
+
+    _makeRingProgram(gl) {
+        // Billboard ring centered at impact lngLat + alt, facing camera.
+        const vs = `#version 300 es
+            precision highp float;
+            in vec2 a_quad;
+            uniform mat4 u_mvp;
+            uniform vec3 u_center_world;
+            uniform float u_radius_world;
+            uniform float u_pixel_ratio;
+            out vec2 v_uv;
+            void main() {
+                // Project center to clip space, then offset in NDC xy.
+                vec4 clip = u_mvp * vec4(u_center_world, 1.0);
+                vec2 pxOff = a_quad * u_radius_world * u_pixel_ratio;
+                clip.xy += pxOff * clip.w;
+                gl_Position = clip;
+                v_uv = a_quad;
+            }`;
+        const fs = `#version 300 es
+            precision highp float;
+            in vec2 v_uv;
+            uniform float u_ring_frac;   // 0..1 animation progress
+            out vec4 fragColor;
+            void main() {
+                float r = length(v_uv);
+                if (r > 1.0) discard;
+                float ring = smoothstep(u_ring_frac - 0.08, u_ring_frac, r)
+                           - smoothstep(u_ring_frac, u_ring_frac + 0.08, r);
+                float inner = 1.0 - smoothstep(0.0, 0.12, r);
+                float alpha = max(ring, inner * 0.4);
+                float fadeOut = 1.0 - u_ring_frac;
+                fragColor = vec4(1.0, 0.25, 0.15, alpha * fadeOut);
+            }`;
+        const compile = (type, src) => {
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+                console.error('ring shader: ' + gl.getShaderInfoLog(s));
+            return s;
+        };
+        const p = gl.createProgram();
+        gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+        gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+        gl.linkProgram(p);
+        this.ringA = { aQuad: gl.getAttribLocation(p, 'a_quad') };
+        this.ringU = {};
+        for (const n of ['u_mvp', 'u_center_world', 'u_radius_world',
+                         'u_pixel_ratio', 'u_ring_frac'])
+            this.ringU[n] = gl.getUniformLocation(p, n);
+        return p;
+    },
+
+    // Convert a local (x, y, alt) or lngLat to world-mercator space
+    // suitable for transform.modelViewProjectionMatrix input:
+    //   world = (mercX * worldSize, mercY * worldSize, altitude_m)
+    _worldPoint(localOrLngLat, alt) {
+        const ws = this.map.transform.worldSize;
+        let lngLat;
+        if (localOrLngLat instanceof maplibregl.LngLat) {
+            lngLat = localOrLngLat;
+        } else {
+            lngLat = lngLatFromLocal(localOrLngLat, state.launcher.lngLat);
+        }
+        const merc = maplibregl.MercatorCoordinate.fromLngLat(lngLat, 0);
+        return [merc.x * ws, merc.y * ws, alt];
+    },
+
+    render(gl, args) {
+        if (state.phase === 'idle' || !state.launcher) return;
+
+        const mvp = this.map.transform.modelViewProjectionMatrix;
+
+        // -------- Trajectory trail --------
+        if (state.trail.length >= 2) {
+            const verts = new Float32Array(state.trail.length * 3);
+            for (let i = 0; i < state.trail.length; i++) {
+                const p = state.trail[i];
+                const w = this._worldPoint(p, p.z);
+                verts[i*3  ] = w[0];
+                verts[i*3+1] = w[1];
+                verts[i*3+2] = w[2];
+            }
+            gl.useProgram(this.program);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.uniformMatrix4fv(this.u.u_mvp, false, mvp);
+            gl.uniform4f(this.u.u_color, 0.95, 0.95, 0.95, 0.9);
+            gl.uniform1f(this.u.u_point_size, 1.0);
+            gl.uniform1f(this.u.u_progress_max, state.trail.length - 1);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.trailVBO);
+            gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(this.aWorld);
+            gl.vertexAttribPointer(this.aWorld, 3, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.LINE_STRIP, 0, state.trail.length);
+        }
+
+        // -------- Missile dot --------
+        if (state.phase === 'flying' && state.pos) {
+            const w = this._worldPoint(state.pos, state.pos.z);
+            gl.useProgram(this.program);
+            gl.uniform4f(this.u.u_color, 1.0, 0.55, 0.1, 1.0);
+            gl.uniform1f(this.u.u_point_size, 9.0);
+            gl.uniform1f(this.u.u_progress_max, 0.0);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.pointVBO);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(w), gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(this.aWorld);
+            gl.vertexAttribPointer(this.aWorld, 3, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.POINTS, 0, 1);
+        }
+
+        // -------- Impact ring pulse --------
+        if (state.impact) {
+            const t = Math.min(1.0, (performance.now() - state.impactTime) / 1500.0);
+            const w = this._worldPoint(state.impact.lngLat, state.impact.alt + 2);
+            gl.useProgram(this.ringProgram);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.uniformMatrix4fv(this.ringU.u_mvp, false, mvp);
+            gl.uniform3f(this.ringU.u_center_world, w[0], w[1], w[2]);
+            // radius in pixels (on screen); scale by ring growth
+            const pxRadius = 60 * (0.3 + 0.7 * t);
+            const dpr = window.devicePixelRatio || 1;
+            gl.uniform1f(this.ringU.u_radius_world, pxRadius / (gl.canvas.width / dpr));
+            gl.uniform1f(this.ringU.u_pixel_ratio, 2.0);   // quad is [-1..1], so halving factor absorbed
+            gl.uniform1f(this.ringU.u_ring_frac, t);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.ringVBO);
+            gl.enableVertexAttribArray(this.ringA.aQuad);
+            gl.vertexAttribPointer(this.ringA.aQuad, 2, gl.FLOAT, false, 0, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+    }
+};
+
+map.on('style.load', () => { map.addLayer(missileLayer); });
+</script>
+</body>
+</html>
