@@ -40,23 +40,36 @@
 </div>
 <script>
 // =============================================================================
-// Viewshed Analysis Example
+// Viewshed Analysis Example — G-buffer + Screen-Space Ray-March
 //
-// Technique:
-//   1. Custom layer based on Arch 4 Pattern 2: reuse terrain.getTerrainMesh()
-//      so the layer renders on the exact terrain surface.
-//   2. MapLibre's drawDepth pre-rendering populates terrainData.depthTexture
-//      every frame. We treat this depth FBO as a screen-space G-buffer.
-//   3. Fragment shader ray-marches in screen space from observer position to
-//      the current fragment, sampling terrain depth at each step. If terrain
-//      is closer to the camera than the ray, the fragment is occluded.
-//   4. gl_FragDepth is set from u_depth at fragment UV — Depth Replacement —
-//      to bit-match base terrain depth and eliminate skirt z-fighting.
+// Pipeline per frame:
+//   [Pass 1 — pre-existing in MapLibre]
+//     drawDepth() at src/webgl/draw/draw_terrain.ts:16-36
+//     ↳ renders terrain mesh depth into screen-size FBO (RGBA-packed float)
+//     ↳ exposed to our layer via terrainData.depthTexture — this is our G-buffer.
+//
+//   [Pass 2 — pre-existing in MapLibre]
+//     drawTerrain() with RTT layers composited — the base map.
+//
+//   [Pass 3 — this custom layer]
+//     For each renderable terrain tile:
+//       - Reuse terrain.getTerrainMesh() (Arch 4 Pattern 2)
+//       - Vertex: same projection as base terrain (matches position exactly)
+//       - Fragment: ray-march the G-buffer (u_depth) from observer to fragment
+//         in screen space; classify as visible/blocked. Output translucent
+//         color and replace gl_FragDepth with unpack(u_depth) to bit-match
+//         base terrain depth → no skirt z-fighting.
+//
+// Why this is "G-buffer based":
+//   MapLibre already does a pre-pass (drawDepth) that serializes terrain depth
+//   into a screen-space texture. That texture IS a G-buffer (one channel:
+//   depth). Our viewshed never touches geometry again — all visibility
+//   queries are screen-space lookups against that buffer.
 //
 // Limitations (intentional, for example simplicity):
-//   - Screen-space: areas not visible on screen cannot occlude or be analyzed.
-//   - Designed for mercator + terrain. Globe mode works but observer XYZ
-//     projection may have minor inaccuracies due to spherical transform.
+//   - Screen-space only: occluders outside the viewport cannot block rays.
+//   - Primarily demonstrates mercator + terrain. Globe works; the observer's
+//     NDC projection via modelViewProjectionMatrix is correct for both.
 // =============================================================================
 
 const map = new maplibregl.Map({
@@ -171,9 +184,16 @@ const viewshedLayer = {
 
         const fs = `#version 300 es
             precision highp float;
+
+            // G-buffer: MapLibre's pre-rendered terrain depth FBO.
+            // Populated each frame by drawDepth() at
+            // src/webgl/draw/draw_terrain.ts:16-36, exposed as
+            // terrainData.depthTexture at src/render/terrain.ts:310.
+            // RGBA-packed 24-bit float depth (unpacked via bitShifts below).
             uniform highp sampler2D u_depth;
+
             uniform vec2 u_viewport;
-            uniform vec3 u_observer_screen;
+            uniform vec3 u_observer_screen;    // NDC-space: (u, v, z) in [0,1]
             uniform float u_observer_valid;
             uniform float u_bias;
             uniform float u_min_distance;
@@ -195,8 +215,9 @@ const viewshedLayer = {
                 vec2 fragUV = gl_FragCoord.xy / u_viewport;
                 float fragZ = gl_FragCoord.z;
 
-                // Force fragment depth to bit-match base terrain depth
-                // — Depth Replacement, eliminates skirt z-fighting.
+                // Depth Replacement: read G-buffer at this fragment's UV and
+                // write it to gl_FragDepth so our depth bit-matches the base
+                // terrain — eliminates skirt z-fighting deterministically.
                 gl_FragDepth = unpack(texture(u_depth, fragUV));
 
                 if (u_observer_valid < 0.5) discard;
@@ -204,13 +225,18 @@ const viewshedLayer = {
                 vec2 obsUV = u_observer_screen.xy;
                 float obsZ = u_observer_screen.z;
 
-                // Trivially visible region around observer
+                // Trivially visible region around observer (avoids self-
+                // occlusion artifacts at the starting point of the ray).
                 if (length(fragUV - obsUV) < u_min_distance) {
                     fragColor = vec4(1.0, 0.95, 0.2, 0.55);
                     return;
                 }
 
-                // Screen-space ray-march from observer to fragment
+                // Screen-space ray-march against the G-buffer.
+                // At each step along observer→fragment we compare the ray's
+                // expected depth to terrain depth sampled from u_depth.
+                // If terrain is closer to the camera (smaller Z), the ray
+                // is blocked at that step.
                 bool blocked = false;
                 int steps = u_steps;
                 for (int i = 1; i < 256; i++) {
@@ -278,11 +304,13 @@ const viewshedLayer = {
         const terrain = this.map.terrain;
         if (!terrain) return;
 
-        // Resolve observer screen position (or mark invalid)
+        // Resolve observer screen position (or mark invalid).
+        // map.queryTerrainElevation is the public API for ground elevation
+        // (includes terrain exaggeration). Returns null if terrain is off.
         let obsScreen = [0, 0, 0];
         let obsValid = 0.0;
         if (observer.lngLat) {
-            const groundEle = terrain.getElevationForLngLat(observer.lngLat) || 0;
+            const groundEle = this.map.queryTerrainElevation(observer.lngLat) || 0;
             const proj = this._projectObserver(groundEle + observer.height);
             if (proj && proj.valid) {
                 obsScreen = [proj.u, proj.v, proj.z];
