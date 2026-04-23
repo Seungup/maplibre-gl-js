@@ -308,14 +308,24 @@ const viewshedLayer = {
         // Vertex: uses MapLibre's official prelude (provides projectTileFor3D
         // for current projection), then calls it with elevation.
         // Outputs mercator (xy) + raw elevation for fragment ray-march.
+        //
+        // Note on uniform declarations: the globe prelude (when shaderDefine
+        // = '#define GLOBE') already declares u_projection_tile_mercator_coords,
+        // u_projection_clipping_plane, u_projection_transition, and
+        // u_projection_fallback_matrix. The mercator prelude does not. We
+        // conditionally declare u_projection_tile_mercator_coords only when
+        // GLOBE is not defined to avoid "redefinition" compile errors.
         const vs = `#version 300 es
             precision highp float;
             ${shaderData.vertexShaderPrelude}
             ${shaderData.define}
 
+            #ifndef GLOBE
+            uniform vec4 u_projection_tile_mercator_coords;
+            #endif
+
             in vec3 a_pos3d;
 
-            uniform vec4 u_projection_tile_mercator_coords;
             uniform sampler2D u_terrain;
             uniform mat4 u_terrain_matrix;
             uniform float u_terrain_dim;
