@@ -169,6 +169,16 @@ const terrainOverlayLayer = {
         gl.enable(gl.CULL_FACE);
         gl.cullFace(gl.BACK);
         gl.frontFace(gl.CCW);
+        // Under globe projection, projectTileFor3D runs through atan/exp/sin/cos
+        // + a 4x4 matrix. Since MapLibre doesn't declare `invariant gl_Position`,
+        // GLSL compilers produce ULP-level NDC-z drift between the terrain
+        // program and ours, causing stochastic LEQUAL failures on skirt
+        // geometry. Bias our fragments toward the camera at hardware depth
+        // precision, and stop writing depth so the drifted values don't
+        // pollute the buffer for later layers.
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(-1.0, -1.0);
+        gl.depthMask(false);
 
         const eleDelta = terrain.getMeshFrameDelta(map.transform.zoom);
         gl.uniform1f(u.u_ele_delta, eleDelta);
@@ -207,6 +217,12 @@ const terrainOverlayLayer = {
                 gl.UNSIGNED_SHORT, 0
             );
         }
+
+        // POLYGON_OFFSET_FILL isn't tracked by painter's state wrappers, so
+        // restore it here to avoid leaking the bias into later layers.
+        // depthMask is re-applied by painter on the next depth-mode set.
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+        gl.depthMask(true);
     }
 };
 
