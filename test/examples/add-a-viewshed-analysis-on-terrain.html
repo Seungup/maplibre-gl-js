@@ -164,6 +164,11 @@ const terrainOverlayLayer = {
         gl.useProgram(program);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        // Match draw_terrain.ts: cull skirt back-faces so buried skirt
+        // geometry can't produce slivers at ridgelines / horizon silhouette.
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(gl.BACK);
+        gl.frontFace(gl.CCW);
 
         const eleDelta = terrain.getMeshFrameDelta(map.transform.zoom);
         gl.uniform1f(u.u_ele_delta, eleDelta);
