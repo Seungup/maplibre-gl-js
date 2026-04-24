@@ -20,9 +20,8 @@
 // Minimal terrain custom layer
 //
 // Reuses MapLibre's terrain mesh (one mesh per renderable tile) and projects
-// each vertex with the official prelude's projectTileFor3D. The fragment
-// shader reads the terrain depth FBO (Depth Replacement) so the overlay
-// shares depth with the base terrain and skirts don't z-fight.
+// each vertex with the official prelude's projectTileFor3D, producing a
+// semi-transparent overlay used to verify that terrain rendering is correct.
 //
 // Public APIs used:
 //   - map.terrain.tileManager.getRenderableTiles()
@@ -119,25 +118,9 @@ const terrainOverlayLayer = {
         const fs = `#version 300 es
             precision highp float;
 
-            uniform highp sampler2D u_depth;
-            uniform vec2 u_viewport;
-
             out vec4 fragColor;
 
-            // Matches the pack in src/shaders/glsl/terrain_depth.fragment.glsl
-            float unpackDepth(vec4 rgba) {
-                const vec4 bitShifts = vec4(
-                    1.0 / (256.0 * 256.0 * 256.0),
-                    1.0 / (256.0 * 256.0),
-                    1.0 / 256.0,
-                    1.0
-                );
-                return dot(rgba, bitShifts);
-            }
-
             void main() {
-                vec2 fragUV = gl_FragCoord.xy / u_viewport;
-                gl_FragDepth = unpackDepth(texture(u_depth, fragUV));
                 fragColor = vec4(0.20, 0.55, 0.95, 0.35);
             }`;
 
@@ -165,8 +148,7 @@ const terrainOverlayLayer = {
             'u_projection_clipping_plane', 'u_projection_transition',
             'u_projection_tile_mercator_coords',
             'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
-            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta',
-            'u_depth', 'u_viewport'
+            'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta'
         ]) u[n] = gl.getUniformLocation(program, n);
 
         const entry = {program, aPos3d, u};
@@ -182,9 +164,6 @@ const terrainOverlayLayer = {
         gl.useProgram(program);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-        const dpr = window.devicePixelRatio || 1;
-        gl.uniform2f(u.u_viewport, gl.canvas.width / dpr, gl.canvas.height / dpr);
 
         const eleDelta = terrain.getMeshFrameDelta(map.transform.zoom);
         gl.uniform1f(u.u_ele_delta, eleDelta);
@@ -211,10 +190,6 @@ const terrainOverlayLayer = {
             gl.uniform1f(u.u_terrain_dim, td.u_terrain_dim);
             gl.uniform4fv(u.u_terrain_unpack, td.u_terrain_unpack);
             gl.uniform1f(u.u_terrain_exaggeration, td.u_terrain_exaggeration);
-
-            gl.activeTexture(gl.TEXTURE3);
-            gl.bindTexture(gl.TEXTURE_2D, td.depthTexture);
-            gl.uniform1i(u.u_depth, 3);
 
             const mesh = terrain.getTerrainMesh(tileID);
             gl.bindBuffer(gl.ARRAY_BUFFER, mesh.vertexBuffer.buffer);
