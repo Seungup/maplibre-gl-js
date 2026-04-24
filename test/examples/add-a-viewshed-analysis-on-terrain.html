@@ -87,7 +87,6 @@ const terrainOverlayLayer = {
             in vec3 a_pos3d;
 
             uniform sampler2D u_terrain;
-            uniform mat4 u_terrain_matrix;
             uniform float u_terrain_dim;
             uniform vec4 u_terrain_unpack;
             uniform float u_terrain_exaggeration;
@@ -98,7 +97,10 @@ const terrainOverlayLayer = {
                 return rgb.r + rgb.g + rgb.b - u_terrain_unpack.a;
             }
             float get_elevation(vec2 pos) {
-                vec2 coord = (u_terrain_matrix * vec4(pos, 0.0, 1.0)).xy * u_terrain_dim + 1.0;
+                // Baseline assumption: DEM tile == render tile (no overzoom),
+                // so tile-local (0..EXTENT) maps directly to DEM UV (0..1).
+                vec2 uv = pos / 8192.0;
+                vec2 coord = uv * u_terrain_dim + 1.0;
                 vec2 f = fract(coord);
                 vec2 c = (floor(coord) + 0.5) / (u_terrain_dim + 2.0);
                 float d = 1.0 / (u_terrain_dim + 2.0);
@@ -147,7 +149,7 @@ const terrainOverlayLayer = {
             'u_projection_matrix', 'u_projection_fallback_matrix',
             'u_projection_clipping_plane', 'u_projection_transition',
             'u_projection_tile_mercator_coords',
-            'u_terrain', 'u_terrain_matrix', 'u_terrain_dim',
+            'u_terrain', 'u_terrain_dim',
             'u_terrain_unpack', 'u_terrain_exaggeration', 'u_ele_delta'
         ]) u[n] = gl.getUniformLocation(program, n);
 
@@ -186,7 +188,6 @@ const terrainOverlayLayer = {
             gl.activeTexture(gl.TEXTURE2);
             gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
             gl.uniform1i(u.u_terrain, 2);
-            gl.uniformMatrix4fv(u.u_terrain_matrix, false, td.u_terrain_matrix);
             gl.uniform1f(u.u_terrain_dim, td.u_terrain_dim);
             gl.uniform4fv(u.u_terrain_unpack, td.u_terrain_unpack);
             gl.uniform1f(u.u_terrain_exaggeration, td.u_terrain_exaggeration);
