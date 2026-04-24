@@ -184,7 +184,7 @@ const terrainOverlayLayer = {
             gl.uniform4f(u.u_projection_tile_mercator_coords, ...proj.tileMercatorCoords);
 
             gl.activeTexture(gl.TEXTURE2);
-            gl.bindTexture(gl.TEXTURE_2D, td.texture.texture);
+            gl.bindTexture(gl.TEXTURE_2D, td.texture);
             gl.uniform1i(u.u_terrain, 2);
             gl.uniformMatrix4fv(u.u_terrain_matrix, false, td.u_terrain_matrix);
             gl.uniform1f(u.u_terrain_dim, td.u_terrain_dim);
